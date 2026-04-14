@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# slipway — machine-wide port-range registry for local dev.
+# https://github.com/primestageprime/slipway
+set -euo pipefail
+
+REGISTRY="${SLIPWAY_REGISTRY:-$HOME/.config/slipway/registry.json}"
+
+die() { echo "slipway: $*" >&2; exit 1; }
+
+command -v jq >/dev/null || die "jq not found in PATH"
+
+ensure_registry() {
+  [[ -f "$REGISTRY" ]] && return
+  mkdir -p "$(dirname "$REGISTRY")"
+  cat > "$REGISTRY" <<'JSON'
+{
+  "port_range": { "start": 4000, "end": 9999 },
+  "reserved": [
+    { "start": 5000, "end": 5000, "note": "macOS AirPlay Receiver (ControlCenter)" },
+    { "start": 7000, "end": 7000, "note": "macOS AirPlay Receiver (ControlCenter)" }
+  ],
+  "apps": {}
+}
+JSON
+}
+
+write() {
+  local tmp="${REGISTRY}.tmp"
+  jq "$@" "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+}
+
+usage() {
+  cat <<'EOF'
+slipway — hand out port ranges to local dev apps so they don't collide.
+
+Usage:
+  slipway claim <app> <size>   Reserve the next free range of <size> ports
+  slipway get <app>            Print "START END" for <app> (exit 1 if unclaimed)
+  slipway release <app>        Free an app's range
+  slipway list                 Show all current allocations
+  slipway reserved             Show system-reserved ports
+
+Env:
+  SLIPWAY_REGISTRY             Override registry path (default: ~/.config/slipway/registry.json)
+EOF
+  exit "${1:-1}"
+}
+
+cmd_get() {
+  local app="$1" start end
+  start=$(jq -r --arg a "$app" '.apps[$a].start // empty' "$REGISTRY")
+  end=$(jq -r --arg a "$app" '.apps[$a].end // empty' "$REGISTRY")
+  [[ -n "$start" ]] || die "no allocation for '$app'"
+  echo "$start $end"
+}
+
+cmd_list() {
+  jq -r '
+    .apps
+    | to_entries
+    | sort_by(.value.start)
+    | (["APP","START","END","SIZE"] | @tsv),
+      (.[] | [.key, .value.start, .value.end, (.value.end - .value.start + 1)] | @tsv)
+  ' "$REGISTRY" | column -t -s $'\t'
+}
+
+cmd_reserved() {
+  jq -r '
+    (.reserved // [])
+    | (["START","END","NOTE"] | @tsv),
+      (.[] | [.start, .end, (.note // "")] | @tsv)
+  ' "$REGISTRY" | column -t -s $'\t'
+}
+
+cmd_release() {
+  local app="$1"
+  jq -e --arg a "$app" '.apps[$a]' "$REGISTRY" >/dev/null \
+    || die "no allocation for '$app'"
+  write --arg a "$app" 'del(.apps[$a])'
+  echo "released: $app"
+}
+
+cmd_claim() {
+  local app="$1" size="${2:-}"
+  [[ -n "$size" ]] || usage
+  [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )) || die "size must be a positive integer"
+
+  if jq -e --arg a "$app" '.apps[$a]' "$REGISTRY" >/dev/null; then
+    die "'$app' already claimed; use 'release' first or 'get' to look it up"
+  fi
+
+  local range_start range_end
+  range_start=$(jq -r '.port_range.start' "$REGISTRY")
+  range_end=$(jq -r '.port_range.end' "$REGISTRY")
+
+  # Taken = apps ∪ reserved, sorted by start.
+  local taken
+  taken=$(jq -c '
+    ([.apps[] | {start, end}] + ((.reserved // []) | map({start, end})))
+    | sort_by(.start)
+  ' "$REGISTRY")
+
+  # Align candidate up to a multiple of size, then walk taken ranges.
+  local candidate=$range_start
+  candidate=$(( ((candidate + size - 1) / size) * size ))
+
+  local n i s e
+  n=$(jq 'length' <<<"$taken")
+  for (( i = 0; i < n; i++ )); do
+    s=$(jq ".[$i].start" <<<"$taken")
+    e=$(jq ".[$i].end" <<<"$taken")
+    if (( candidate + size - 1 < s )); then
+      break
+    fi
+    if (( candidate <= e )); then
+      candidate=$(( ((e + 1 + size - 1) / size) * size ))
+    fi
+  done
+
+  local new_end=$(( candidate + size - 1 ))
+  (( new_end <= range_end )) || die "no free range of size $size in [$range_start,$range_end]"
+
+  write --arg a "$app" --argjson s "$candidate" --argjson e "$new_end" \
+    '.apps[$a] = {start: $s, end: $e}'
+
+  echo "$candidate $new_end"
+}
+
+ensure_registry
+[[ $# -ge 1 ]] || usage
+sub="$1"; shift || true
+case "$sub" in
+  claim)    [[ $# -eq 2 ]] || usage; cmd_claim "$@" ;;
+  get)      [[ $# -eq 1 ]] || usage; cmd_get "$@" ;;
+  release)  [[ $# -eq 1 ]] || usage; cmd_release "$@" ;;
+  list)     [[ $# -eq 0 ]] || usage; cmd_list ;;
+  reserved) [[ $# -eq 0 ]] || usage; cmd_reserved ;;
+  -h|--help|help) usage 0 ;;
+  *) usage ;;
+esac
