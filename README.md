@@ -46,11 +46,13 @@ Or drop `bin/slipway` anywhere on your `PATH`.
 ## Usage
 
 ```
-slipway claim <app> <size>   # reserve next free range of <size> ports
-slipway get <app>            # print "START END" (exit 1 if unclaimed)
-slipway release <app>        # free an app's range
-slipway list                 # show all allocations
-slipway reserved             # show system-reserved ports
+slipway claim <app> <size>              # reserve next free range of <size> ports
+slipway get <app>                       # print "START END" (exit 1 if unclaimed)
+slipway release <app>                   # free an app's range
+slipway list                            # show all allocations
+slipway reserved                        # show system-reserved ports
+slipway reserved add <s> <e> [note]     # reserve a range (e.g. a port a daemon holds)
+slipway reserved remove <s>             # un-reserve by start port
 ```
 
 Allocations are size-aligned: claiming size 1000 returns a range starting

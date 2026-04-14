@@ -37,8 +37,10 @@ Usage:
   slipway claim <app> <size>   Reserve the next free range of <size> ports
   slipway get <app>            Print "START END" for <app> (exit 1 if unclaimed)
   slipway release <app>        Free an app's range
-  slipway list                 Show all current allocations
-  slipway reserved             Show system-reserved ports
+  slipway list                         Show all current allocations
+  slipway reserved [list]              Show system-reserved ports
+  slipway reserved add <s> <e> [note]  Reserve a port range
+  slipway reserved remove <s>          Remove a reserved entry by start port
 
 Env:
   SLIPWAY_REGISTRY             Override registry path (default: ~/.config/slipway/registry.json)
@@ -65,11 +67,39 @@ cmd_list() {
 }
 
 cmd_reserved() {
-  jq -r '
-    (.reserved // [])
-    | (["START","END","NOTE"] | @tsv),
-      (.[] | [.start, .end, (.note // "")] | @tsv)
-  ' "$REGISTRY" | column -t -s $'\t'
+  local op="${1:-list}"
+  case "$op" in
+    ""|list)
+      jq -r '
+        (.reserved // [])
+        | (["START","END","NOTE"] | @tsv),
+          (.[] | [.start, .end, (.note // "")] | @tsv)
+      ' "$REGISTRY" | column -t -s $'\t'
+      ;;
+    add)
+      local start="${2:-}" end="${3:-}" note="${4:-}"
+      [[ -n "$start" && -n "$end" ]] || die "usage: slipway reserved add <start> <end> [note]"
+      [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] \
+        || die "start and end must be integers"
+      (( end >= start )) || die "end must be >= start"
+      write --argjson s "$start" --argjson e "$end" --arg n "$note" \
+        '.reserved = ((.reserved // []) + [{start:$s, end:$e} + (if $n == "" then {} else {note:$n} end)])
+         | .reserved |= sort_by(.start)'
+      echo "reserved: $start-$end${note:+ ($note)}"
+      ;;
+    remove|rm)
+      local start="${2:-}"
+      [[ -n "$start" ]] || die "usage: slipway reserved remove <start>"
+      [[ "$start" =~ ^[0-9]+$ ]] || die "start must be an integer"
+      jq -e --argjson s "$start" '(.reserved // []) | any(.start == $s)' "$REGISTRY" >/dev/null \
+        || die "no reserved entry starting at $start"
+      write --argjson s "$start" '.reserved = ((.reserved // []) | map(select(.start != $s)))'
+      echo "removed reserved entry starting at $start"
+      ;;
+    *)
+      die "unknown reserved subcommand: $op (expected: list, add, remove)"
+      ;;
+  esac
 }
 
 cmd_release() {
@@ -134,7 +164,7 @@ case "$sub" in
   get)      [[ $# -eq 1 ]] || usage; cmd_get "$@" ;;
   release)  [[ $# -eq 1 ]] || usage; cmd_release "$@" ;;
   list)     [[ $# -eq 0 ]] || usage; cmd_list ;;
-  reserved) [[ $# -eq 0 ]] || usage; cmd_reserved ;;
+  reserved) cmd_reserved "$@" ;;
   -h|--help|help) usage 0 ;;
   *) usage ;;
 esac

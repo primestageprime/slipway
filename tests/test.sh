@@ -70,6 +70,19 @@ got=$("$SLIPWAY" claim next 1)
 # Should skip 5000 (reserved) → 5001.
 assert_eq "$got" "5001 5001" "size 1 after fill skips reserved 5000"
 
+echo "# reserved add/remove"
+fresh_registry
+"$SLIPWAY" claim first 100 >/dev/null        # takes 4000-4099
+"$SLIPWAY" reserved add 4100 4199 "test" >/dev/null
+got=$("$SLIPWAY" claim next 100)             # should skip 4100-4199
+assert_eq "$got" "4200 4299" "claim skips added reserved block"
+"$SLIPWAY" release next >/dev/null
+"$SLIPWAY" reserved remove 4100 >/dev/null
+got=$("$SLIPWAY" claim after 100)            # reservation gone, 4100 free again
+assert_eq "$got" "4100 4199" "claim reuses previously-reserved range after removal"
+assert_exit 1 "reserved add with missing args fails" "$SLIPWAY" reserved add 8000
+assert_exit 1 "reserved remove non-existent fails" "$SLIPWAY" reserved remove 9999
+
 echo "# range exhaustion"
 fresh_registry
 "$SLIPWAY" claim big 1000 >/dev/null
