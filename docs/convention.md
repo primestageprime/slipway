@@ -47,7 +47,7 @@ name, etc.) and `{app}` is the slipway app key.
 
 ## Raw TCP: ports only
 
-Postgres, MQTT, SpacetimeDB, and any other non-HTTP service can't go
+Postgres, MQTT, Redis, and any other non-HTTP service can't go
 through Caddy — clients connect by host+port. For these, use slipway
 ports directly, and document your offsets.
 
@@ -59,7 +59,7 @@ A typical layout for an app that claims 100 ports:
 | 1      | API (HTTP, behind Caddy) |
 | 2      | Postgres |
 | 3      | MQTT |
-| 4      | SpacetimeDB |
+| 4      | Redis |
 | 5      | Admin dashboard |
 
 In your startup:

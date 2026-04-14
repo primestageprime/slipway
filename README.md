@@ -5,16 +5,16 @@ independent dev apps so multiple stacks on one machine don't step on each
 other.
 
 ```sh
-$ slipway claim amygdala 1000
+$ slipway claim bigapp 1000
 4000 4999
 
-$ slipway claim dside 100
+$ slipway claim webapp 100
 5100 5199           # skipped 5000 — reserved for macOS AirPlay
 
 $ slipway list
-APP       START  END   SIZE
-amygdala  4000   4999  1000
-dside     5100   5199  100
+APP     START  END   SIZE
+bigapp  4000   4999  1000
+webapp  5100   5199  100
 ```
 
 ## Why
@@ -55,7 +55,7 @@ slipway reserved             # show system-reserved ports
 
 Allocations are size-aligned: claiming size 1000 returns a range starting
 on a 1000-boundary, size 100 on a 100-boundary. This keeps the port space
-tidy and makes ports human-memorable (amygdala is always 4xxx, dside is
+tidy and makes ports human-memorable (bigapp is always 4xxx, webapp is
 always 5xxx).
 
 ### Integration
@@ -73,9 +73,10 @@ DB_PORT=$((START + 1))
 # …
 ```
 
-See [examples/](examples/) for real-world wiring with
-[amygdala](examples/amygdala-snippet.sh) and
-[dside](examples/dside-snippet.sh).
+See [examples/](examples/) for integration snippets:
+[multi-service](examples/multi-service.sh) (one stack, many services, many
+environments) and [single-service](examples/single-service.sh) (one web app
+fronted by Caddy).
 
 ## Registry file
 
@@ -86,8 +87,8 @@ See [examples/](examples/) for real-world wiring with
   "port_range":  { "start": 4000, "end": 9999 },
   "reserved":    [{ "start": 5000, "end": 5000, "note": "macOS AirPlay" }],
   "apps": {
-    "amygdala": { "start": 4000, "end": 4999 },
-    "dside":    { "start": 5100, "end": 5199 }
+    "bigapp": { "start": 4000, "end": 4999 },
+    "webapp": { "start": 5100, "end": 5199 }
   }
 }
 ```
