@@ -1,5 +1,5 @@
 {
-  "name": "@primestageprime/slipway",
+  "name": "@primestage/slipway",
   "version": "0.1.0",
   "description": "Machine-wide port-range registry for local dev — hand out port ranges to independent apps so they don't collide.",
   "keywords": ["port", "registry", "dev", "localhost", "caddy"],
