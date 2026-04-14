@@ -9,6 +9,7 @@ if (( BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) ))
   exit 1
 fi
 
+SLIPWAY_VERSION="0.2.0"
 REGISTRY="${SLIPWAY_REGISTRY:-$HOME/.config/slipway/registry.json}"
 REGISTRY_VERSION=1
 LOCK_TIMEOUT_DS="${SLIPWAY_LOCK_TIMEOUT_DS:-100}"  # tenths of a second
@@ -18,6 +19,10 @@ readonly E_GENERIC=1 E_USAGE=2 E_NOTFOUND=3 E_EXHAUSTED=4 E_LOCK=5 E_CONFLICT=6 
 
 die_code() { local c="$1"; shift; echo "slipway: $*" >&2; exit "$c"; }
 die() { die_code "$E_GENERIC" "$@"; }
+debug() {
+  [[ "${SLIPWAY_DEBUG:-0}" != "0" ]] && echo "slipway[debug]: $*" >&2
+  return 0
+}
 
 command -v jq >/dev/null || die "jq not found in PATH"
 
@@ -105,6 +110,7 @@ acquire_lock() {
   (( LOCK_HELD == 0 )) || return 0
   local lock="${REGISTRY}.lock"
   local i=0 pid1 pid2
+  debug "acquire_lock: $lock (timeout=$((LOCK_TIMEOUT_DS/10))s)"
   while ! mkdir "$lock" 2>/dev/null; do
     pid1=$(cat "$lock/pid" 2>/dev/null || true)
     if [[ -n "$pid1" ]] && ! kill -0 "$pid1" 2>/dev/null; then
@@ -126,6 +132,7 @@ acquire_lock() {
     die "failed to write lock pidfile at $lock/pid"
   fi
   LOCK_HELD=1
+  debug "acquire_lock: held by pid $$"
 }
 
 write_unlocked() {
@@ -157,17 +164,21 @@ slipway — hand out port ranges to local dev apps so they don't collide.
 
 Usage:
   slipway claim <app> <size> [--dry-run] [--json]
-  slipway reclaim <app> <size> [--json]           Atomically release + re-claim at <size>
-  slipway ensure <app> <size> [--json]            Claim if missing; noop if claimed at same size
-  slipway get <app> [--json]                      Print "START END" (exit 3 if unclaimed)
-  slipway release <app> [--if-claimed]            Free an app's range; --if-claimed = idempotent
-  slipway list [--json|--tsv]                     Show all allocations
-  slipway conflicts <port> [--json]               Show who holds <port>; exit 3 if free
-  slipway doctor                                  Sanity-check the registry
-  slipway caddy <app> [subdomain] [offset]        Emit a Caddyfile fragment for <app>
+  slipway reclaim <app> <size> [--no-move] [--json]  Atomically release + re-claim at <size>
+  slipway ensure <app> <size> [--json]               Claim if missing; noop if claimed at same size
+  slipway get <app> [--json]                         Print "START END" (exit 3 if unclaimed)
+  slipway port <app> [offset]                        Print a single port (start+offset)
+  slipway release <app> [--if-claimed]               Free an app's range; --if-claimed = idempotent
+  slipway list [--json|--tsv]                        Show all allocations
+  slipway conflicts <port> [--json]                  Show who holds <port>; exit 3 if free
+  slipway doctor [--repair]                          Sanity-check the registry; --repair clears orphan lock
+  slipway caddy <app> [subdomain] [offset]           Emit a Caddyfile fragment for <app>
+  slipway config [show]                              Show port_range + registry_version
+  slipway config port-range <s> <e>                  Reconfigure port_range (refuses orphaning apps)
+  slipway version                                    Print slipway version
   slipway reserved [list|--json]
-  slipway reserved add <s> <e> [note] [--force]   Add a reserved range (refuses app overlap without --force)
-  slipway reserved remove <s>                     Remove a reserved entry by start port
+  slipway reserved add <s> <e> [note] [--force]      Add a reserved range (refuses app overlap without --force)
+  slipway reserved remove <s>                        Remove a reserved entry by start port
 
 Exit codes:
   0 ok  1 generic  2 usage  3 not-found  4 exhausted  5 lock-timeout  6 conflict  7 schema
@@ -176,6 +187,7 @@ Env:
   SLIPWAY_REGISTRY             Override registry path (default: ~/.config/slipway/registry.json)
   SLIPWAY_LOCK_TIMEOUT_DS      Lock acquisition timeout in tenths of seconds (default: 100)
   SLIPWAY_LIB                  Override commands library path (default: alongside the binary)
+  SLIPWAY_DEBUG                If set to a non-zero value, log internal decisions to stderr
 EOF
   exit "${1:-$E_USAGE}"
 }
@@ -183,19 +195,28 @@ EOF
 # shellcheck source=../lib/slipway/commands.sh
 source "$SLIPWAY_LIB"
 
-ensure_registry
-[[ $# -ge 1 ]] || usage
+[[ $# -ge 1 ]] || { ensure_registry; usage; }
 sub="$1"; shift || true
+
+# `version` works without touching the registry (useful when registry is broken).
+if [[ "$sub" == "version" || "$sub" == "--version" ]]; then
+  echo "slipway $SLIPWAY_VERSION"
+  exit 0
+fi
+
+ensure_registry
 case "$sub" in
   claim)     cmd_claim "$@" ;;
   reclaim)   cmd_reclaim "$@" ;;
   ensure)    cmd_ensure "$@" ;;
   get)       cmd_get "$@" ;;
+  port)      cmd_port "$@" ;;
   release)   cmd_release "$@" ;;
   list)      cmd_list "$@" ;;
   conflicts) cmd_conflicts "$@" ;;
-  doctor)    [[ $# -eq 0 ]] || usage; cmd_doctor ;;
+  doctor)    cmd_doctor "$@" ;;
   caddy)     cmd_caddy "$@" ;;
+  config)    cmd_config "$@" ;;
   reserved)  cmd_reserved "$@" ;;
   -h|--help|help) usage 0 ;;
   *) usage ;;

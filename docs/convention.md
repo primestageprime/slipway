@@ -22,7 +22,16 @@ Run Caddy as a local reverse proxy that routes by `Host` header:
 import conf.d/*.Caddyfile
 ```
 
-Each app drops a fragment into `~/.config/caddy/conf.d/`:
+Each app drops a fragment into `~/.config/caddy/conf.d/`. For the common
+case (one HTTP service on a known offset), `slipway caddy` writes the
+fragment for you:
+
+```sh
+slipway caddy myapp > ~/.config/caddy/conf.d/myapp.Caddyfile        # offset 0
+slipway caddy myapp dev-api 1 >> ~/.config/caddy/conf.d/myapp.Caddyfile
+```
+
+For hand-rolled fragments (e.g. TLS passthrough), write them directly:
 
 ```
 # ~/.config/caddy/conf.d/myapp.Caddyfile
@@ -65,12 +74,15 @@ A typical layout for an app that claims 100 ports:
 In your startup:
 
 ```sh
-read -r START _END < <(slipway get myapp)
-export UI_PORT=$((START + 0))
-export API_PORT=$((START + 1))
-export PG_PORT=$((START + 2))
+slipway ensure myapp 100 >/dev/null
+export UI_PORT=$(slipway port myapp 0)
+export API_PORT=$(slipway port myapp 1)
+export PG_PORT=$(slipway port myapp 2)
 # …
 ```
+
+`slipway port` does the `start + offset` arithmetic and errors if the
+offset leaves the claimed range.
 
 ## Rule of thumb
 

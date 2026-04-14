@@ -1,0 +1,118 @@
+.TH SLIPWAY 1 "2026-04-14" "slipway 0.2.0" "User Commands"
+.SH NAME
+slipway \- machine-wide port-range registry for local dev
+.SH SYNOPSIS
+.B slipway
+.I subcommand
+[\fIargs\fR] [\fIflags\fR]
+.SH DESCRIPTION
+.B slipway
+hands out size-aligned port ranges to local dev apps so that multiple
+stacks on one machine do not collide. State lives in a JSON registry
+(default: \fI~/.config/slipway/registry.json\fR); mutating operations
+are serialized through a lockdir.
+.SH SUBCOMMANDS
+.TP
+.BR claim " \fIapp\fR \fIsize\fR [--dry-run] [--json]"
+Reserve the next free size-aligned range for \fIapp\fR. Exits 6 if the
+app is already claimed, 4 if the range is exhausted.
+.TP
+.BR reclaim " \fIapp\fR \fIsize\fR [--no-move] [--json]"
+Atomically release and re-claim \fIapp\fR at a new \fIsize\fR. With
+\fB--no-move\fR, grow/shrink in place or fail.
+.TP
+.BR ensure " \fIapp\fR \fIsize\fR [--json]"
+Idempotent claim: claim if missing, noop if already at \fIsize\fR, exit 6
+if already claimed at a different size.
+.TP
+.BR get " \fIapp\fR [--json]"
+Print "START END" (or JSON). Exit 3 if unclaimed.
+.TP
+.BR port " \fIapp\fR [\fIoffset\fR]"
+Print a single port (start + offset). Exits 2 if the offset falls
+outside the claimed range.
+.TP
+.BR release " \fIapp\fR [--if-claimed]"
+Free the app's range. With \fB--if-claimed\fR, missing apps are a no-op.
+.TP
+.B list [--json|--tsv]
+Show all allocations. Default table, \fI--tsv\fR for piping.
+.TP
+.BR conflicts " \fIport\fR [--json]"
+Show which app or reserved range holds \fIport\fR. Exit 3 if free.
+.TP
+.B doctor [--repair]
+Sanity-check the registry: orphaned lock, out-of-range apps, overlaps.
+\fI--repair\fR clears orphaned locks.
+.TP
+.BR caddy " \fIapp\fR [\fIsubdomain\fR] [\fIoffset\fR]"
+Emit a Caddyfile fragment:
+\fIsubdomain\fR.\fIapp\fR.localhost → localhost:start+offset.
+Defaults: subdomain=\fIdev\fR, offset=0.
+.TP
+.B config [show]
+.TQ
+.BR config " port-range \fIstart\fR \fIend\fR"
+Show registry config, or reconfigure the port_range (refuses if any
+existing app would be orphaned).
+.TP
+.B version
+Print slipway version.
+.TP
+.BR reserved " [list|--json]"
+.TQ
+.BR reserved " add \fIstart\fR \fIend\fR [\fInote\fR] [--force]"
+.TQ
+.BR reserved " remove \fIstart\fR"
+Manage the reserved-ranges list. \fBadd\fR refuses to overlap a claimed
+app without \fB--force\fR.
+.SH EXIT CODES
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Generic error.
+.TP
+.B 2
+Usage error (bad flags, bad arguments).
+.TP
+.B 3
+Not found (app, reserved entry, or port).
+.TP
+.B 4
+Port range exhausted.
+.TP
+.B 5
+Lock acquisition timed out.
+.TP
+.B 6
+Conflict (already claimed, size mismatch, overlap).
+.TP
+.B 7
+Registry schema invalid.
+.SH ENVIRONMENT
+.TP
+.B SLIPWAY_REGISTRY
+Override the registry path (default: \fI~/.config/slipway/registry.json\fR).
+.TP
+.B SLIPWAY_LOCK_TIMEOUT_DS
+Lock acquisition timeout, in tenths of a second (default: 100 = 10s).
+.TP
+.B SLIPWAY_LIB
+Override the commands library path. Default: \fI../lib/slipway/commands.sh\fR
+relative to the resolved binary path.
+.TP
+.B SLIPWAY_DEBUG
+If non-zero, log internal decisions (lock acquisition, allocation) to
+stderr.
+.SH FILES
+.TP
+.I ~/.config/slipway/registry.json
+Default registry. Override via \fBSLIPWAY_REGISTRY\fR.
+.TP
+.I ~/.config/slipway/registry.json.lock
+Lockdir. Contains a \fBpid\fR file naming the holder. Remove manually
+(\fBdoctor --repair\fR, or \fBrm -rf\fR) if a holder crashed.
+.SH SEE ALSO
+Project homepage: https://github.com/primestageprime/slipway

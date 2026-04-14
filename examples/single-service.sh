@@ -6,34 +6,22 @@
 # Claim a small slot, bind the dev server to the UI port, and write a
 # Caddy fragment so the app is reachable at dev.webapp.localhost
 # regardless of which port it actually landed on.
+set -euo pipefail
 
 APP_NAME="webapp"
 APP_SIZE=100
 
-load_port_range() {
-  if ! slipway get "$APP_NAME" >/dev/null 2>&1; then
-    slipway claim "$APP_NAME" "$APP_SIZE" >/dev/null || exit 1
-  fi
-  local start end
-  read -r start end < <(slipway get "$APP_NAME")
-  UI_PORT=$((start + 0))
-  export UI_PORT
-}
+# `ensure` is the idempotent claim: no-op if already at APP_SIZE, claim if
+# missing, exit 6 if claimed at a different size.
+read -r START _END < <(slipway ensure "$APP_NAME" "$APP_SIZE")
+UI_PORT=$((START + 0))
+export UI_PORT
 
-write_caddy_fragment() {
-  local caddy_dir="$HOME/.config/caddy/conf.d"
-  mkdir -p "$caddy_dir"
-  # Shell expands $UI_PORT; Caddyfile has no env-var expansion of its own,
-  # so we must interpolate here rather than rely on Caddy to do it.
-  cat > "$caddy_dir/${APP_NAME}.Caddyfile" <<EOF
-dev.${APP_NAME}.localhost {
-  reverse_proxy localhost:${UI_PORT}
-}
-EOF
-}
-
-load_port_range
-write_caddy_fragment
+# Emit the Caddy fragment via slipway — the binary knows the addressing
+# convention (dev.$APP_NAME.localhost) and the UI is always at offset 0.
+caddy_dir="$HOME/.config/caddy/conf.d"
+mkdir -p "$caddy_dir"
+slipway caddy "$APP_NAME" > "$caddy_dir/${APP_NAME}.Caddyfile"
 
 # Many dev-server CLIs hardcode a port in package.json's "dev" script
 # (e.g. "vite dev --port 5173"). Pass --port explicitly rather than relying

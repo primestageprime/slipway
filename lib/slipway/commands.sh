@@ -181,39 +181,37 @@ cmd_release() {
 # Core allocator: finds the next free size-aligned range.
 # Sets globals: ALLOC_START, ALLOC_END. Dies on exhaustion.
 # Optional arg: app name to exclude from "taken" (for reclaim).
+#
+# Implementation: one jq invocation does the whole walk (prior versions
+# spawned 2N+1 jq processes per claim; that's pathological at N≫10).
 allocate_range() {
   local size="$1" exclude="${2:-}"
-  local range_start range_end
-  range_start=$(jq -r '.port_range.start' "$REGISTRY")
-  range_end=$(jq -r '.port_range.end' "$REGISTRY")
-
-  local taken
-  taken=$(jq -c --arg ex "$exclude" '
-    ([.apps | to_entries[] | select(.key != $ex) | .value | {start, end}]
-     + ((.reserved // []) | map({start, end})))
-    | sort_by(.start)
+  local out
+  out=$(jq -r --argjson sz "$size" --arg ex "$exclude" '
+    def align_up(n): (((n + $sz - 1) / $sz) | floor) * $sz;
+    . as $r
+    | $r.port_range.start as $rs
+    | $r.port_range.end as $re
+    | ([$r.apps | to_entries[] | select(.key != $ex) | .value | {start, end}]
+       + (($r.reserved // []) | map({start, end})))
+      | sort_by(.start) as $taken
+    | (reduce range(0; $taken | length) as $i (align_up($rs);
+         if (. + $sz - 1) < $taken[$i].start then .
+         elif . <= $taken[$i].end then align_up($taken[$i].end + 1)
+         else .
+         end)) as $start
+    | if ($start + $sz - 1) > $re then "EXHAUSTED \($rs) \($re)"
+      else "OK \($start) \($start + $sz - 1)"
+      end
   ' "$REGISTRY")
-
-  local candidate=$range_start
-  candidate=$(( ((candidate + size - 1) / size) * size ))
-
-  local n i s e
-  n=$(jq 'length' <<<"$taken")
-  for (( i = 0; i < n; i++ )); do
-    s=$(jq ".[$i].start" <<<"$taken")
-    e=$(jq ".[$i].end" <<<"$taken")
-    if (( candidate + size - 1 < s )); then
-      break
-    fi
-    if (( candidate <= e )); then
-      candidate=$(( ((e + 1 + size - 1) / size) * size ))
-    fi
-  done
-
-  local new_end=$(( candidate + size - 1 ))
-  (( new_end <= range_end )) || die_code "$E_EXHAUSTED" "no free range of size $size in [$range_start,$range_end]"
-  ALLOC_START=$candidate
-  ALLOC_END=$new_end
+  local status s e
+  read -r status s e <<<"$out"
+  if [[ "$status" == "EXHAUSTED" ]]; then
+    die_code "$E_EXHAUSTED" "no free range of size $size in [$s,$e]"
+  fi
+  ALLOC_START=$s
+  ALLOC_END=$e
+  debug "allocate_range: size=$size exclude='${exclude}' → $ALLOC_START-$ALLOC_END"
 }
 
 cmd_claim() {
@@ -264,10 +262,11 @@ cmd_claim() {
 }
 
 cmd_reclaim() {
-  local app="" size="" json=0
+  local app="" size="" json=0 no_move=0
   while (( $# )); do
     case "$1" in
-      --json) json=1; shift ;;
+      --json)    json=1; shift ;;
+      --no-move) no_move=1; shift ;;
       -*) die_code "$E_USAGE" "unknown flag: $1" ;;
       *)
         if [[ -z "$app" ]]; then app="$1"
@@ -278,7 +277,7 @@ cmd_reclaim() {
         ;;
     esac
   done
-  [[ -n "$app" && -n "$size" ]] || die_code "$E_USAGE" "usage: slipway reclaim <app> <size>"
+  [[ -n "$app" && -n "$size" ]] || die_code "$E_USAGE" "usage: slipway reclaim <app> <size> [--no-move]"
   if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size <= 0 )); then
     die_code "$E_USAGE" "size must be a positive integer"
   fi
@@ -287,11 +286,79 @@ cmd_reclaim() {
   jq -e --arg a "$app" '.apps[$a]' "$REGISTRY" >/dev/null \
     || die_code "$E_NOTFOUND" "no allocation for '$app' (use 'claim' for new apps)"
 
-  allocate_range "$size" "$app"
+  if (( no_move )); then
+    local cur_start cur_end desired_end range_end collision
+    cur_start=$(jq -r --arg a "$app" '.apps[$a].start' "$REGISTRY")
+    cur_end=$(jq -r --arg a "$app" '.apps[$a].end' "$REGISTRY")
+    if (( cur_start % size != 0 )); then
+      die_code "$E_CONFLICT" "current start $cur_start is not a multiple of $size; cannot reclaim in place"
+    fi
+    desired_end=$(( cur_start + size - 1 ))
+    range_end=$(jq -r '.port_range.end' "$REGISTRY")
+    (( desired_end <= range_end )) \
+      || die_code "$E_EXHAUSTED" "in-place range $cur_start-$desired_end exceeds port_range.end=$range_end"
+    collision=$(jq -r --arg ex "$app" --argjson s "$cur_start" --argjson e "$desired_end" '
+      [ (.apps | to_entries[] | select(.key != $ex) | select(.value.start <= $e and .value.end >= $s) | .key),
+        ((.reserved // [])[] | select(.start <= $e and .end >= $s) | "reserved(\(.start)-\(.end))")
+      ] | join(",")
+    ' "$REGISTRY")
+    if [[ -n "$collision" ]]; then
+      die_code "$E_CONFLICT" "cannot reclaim '$app' in place to size $size: conflicts with $collision"
+    fi
+    ALLOC_START=$cur_start
+    ALLOC_END=$desired_end
+  else
+    allocate_range "$size" "$app"
+  fi
 
   write_unlocked --arg a "$app" --argjson s "$ALLOC_START" --argjson e "$ALLOC_END" \
     '.apps[$a] = {start: $s, end: $e}'
   emit_allocation "$app" "$ALLOC_START" "$ALLOC_END" "$json"
+}
+
+cmd_port() {
+  local app="${1:-}" offset="${2:-0}"
+  [[ -n "$app" ]] || die_code "$E_USAGE" "usage: slipway port <app> [offset]"
+  if ! [[ "$offset" =~ ^[0-9]+$ ]]; then
+    die_code "$E_USAGE" "offset must be a non-negative integer"
+  fi
+  local start end
+  start=$(jq -r --arg a "$app" '.apps[$a].start // empty' "$REGISTRY")
+  [[ -n "$start" ]] || die_code "$E_NOTFOUND" "no allocation for '$app'"
+  end=$(jq -r --arg a "$app" '.apps[$a].end' "$REGISTRY")
+  local port=$(( start + offset ))
+  (( port <= end )) || die_code "$E_USAGE" "offset $offset exceeds app range ($start-$end)"
+  echo "$port"
+}
+
+cmd_config() {
+  local op="${1:-show}"
+  case "$op" in
+    show|"")
+      jq -r '"port_range: \(.port_range.start)-\(.port_range.end)\nregistry_version: \(.registry_version)"' "$REGISTRY"
+      ;;
+    port-range)
+      local s="${2:-}" e="${3:-}"
+      [[ -n "$s" && -n "$e" ]] || die_code "$E_USAGE" "usage: slipway config port-range <start> <end>"
+      if ! [[ "$s" =~ ^[0-9]+$ && "$e" =~ ^[0-9]+$ ]]; then
+        die_code "$E_USAGE" "start and end must be integers"
+      fi
+      (( e >= s )) || die_code "$E_USAGE" "end must be >= start"
+      acquire_lock
+      local orphans
+      orphans=$(jq -r --argjson s "$s" --argjson e "$e" '
+        [.apps | to_entries[] | select(.value.start < $s or .value.end > $e) | .key] | join(",")
+      ' "$REGISTRY")
+      if [[ -n "$orphans" ]]; then
+        die_code "$E_CONFLICT" "new port_range [$s,$e] would orphan apps: $orphans (release or reclaim first)"
+      fi
+      write_unlocked --argjson s "$s" --argjson e "$e" '.port_range = {start:$s, end:$e}'
+      echo "port_range: $s-$e"
+      ;;
+    *)
+      die_code "$E_USAGE" "unknown config subcommand: $op (expected: show, port-range)"
+      ;;
+  esac
 }
 
 cmd_ensure() {
@@ -354,6 +421,13 @@ EOF
 }
 
 cmd_doctor() {
+  local repair=0
+  case "${1:-}" in
+    --repair) repair=1 ;;
+    "") ;;
+    *) die_code "$E_USAGE" "unknown flag: $1" ;;
+  esac
+
   local issues=0
   local range_start range_end
   range_start=$(jq -r '.port_range.start' "$REGISTRY")
@@ -366,8 +440,11 @@ cmd_doctor() {
     pid=$(cat "$lock/pid" 2>/dev/null || true)
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       echo "ok: lock held by live pid $pid"
+    elif (( repair == 1 )); then
+      rm -rf "$lock" 2>/dev/null || die "cannot remove $lock (permissions?)"
+      echo "repaired: removed orphaned lock at $lock (pid=${pid:-<empty>})"
     else
-      echo "WARN: orphaned lock at $lock (pid=${pid:-<empty>}); rm -rf to clear"
+      echo "WARN: orphaned lock at $lock (pid=${pid:-<empty>}); re-run with --repair or rm -rf"
       issues=$((issues + 1))
     fi
   else

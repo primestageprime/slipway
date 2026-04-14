@@ -352,6 +352,127 @@ else
   fail=$((fail + 1))
 fi
 
+echo "# doctor --repair removes orphaned lock"
+fresh_registry
+mkdir "$SLIPWAY_REGISTRY.lock"
+echo "9999999" > "$SLIPWAY_REGISTRY.lock/pid"
+out=$("$SLIPWAY" doctor --repair)
+if [[ "$out" == *"repaired"* ]] && [[ ! -d "$SLIPWAY_REGISTRY.lock" ]]; then
+  echo "  ok: --repair cleared orphan lock"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: doctor --repair output: $out"
+  fail=$((fail + 1))
+fi
+
+echo "# version"
+out=$("$SLIPWAY" version)
+if [[ "$out" =~ ^slipway\ [0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "  ok: version prints 'slipway X.Y.Z'"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: version: $out"
+  fail=$((fail + 1))
+fi
+# `version` must work even when the registry is missing/broken.
+SLIPWAY_REGISTRY=/nonexistent/nope.json "$SLIPWAY" version >/dev/null
+pass=$((pass + 1))
+echo "  ok: version works without a readable registry"
+
+echo "# port subcommand"
+fresh_registry
+"$SLIPWAY" claim app1 10 >/dev/null                        # 4000-4009
+assert_eq "$("$SLIPWAY" port app1)"    "4000" "port default offset = start"
+assert_eq "$("$SLIPWAY" port app1 3)"  "4003" "port with offset"
+assert_eq "$("$SLIPWAY" port app1 9)"  "4009" "port at max offset"
+assert_exit 2 "port offset past end (E_USAGE)" "$SLIPWAY" port app1 10
+assert_exit 3 "port on unknown app (E_NOTFOUND)" "$SLIPWAY" port ghost
+
+echo "# config show + port-range"
+fresh_registry
+out=$("$SLIPWAY" config show)
+if [[ "$out" == *"port_range: 4000-9999"* && "$out" == *"registry_version: 1"* ]]; then
+  echo "  ok: config show"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: config show: $out"
+  fail=$((fail + 1))
+fi
+"$SLIPWAY" claim app1 100 >/dev/null                        # 4000-4099
+# Shrinking port_range to exclude app1 must fail.
+assert_exit 6 "config port-range refuses orphan (E_CONFLICT)" "$SLIPWAY" config port-range 5000 6000
+# Widening port_range should succeed (no orphans).
+"$SLIPWAY" config port-range 4000 10000 >/dev/null
+out=$("$SLIPWAY" config show)
+if [[ "$out" == *"port_range: 4000-10000"* ]]; then
+  echo "  ok: config port-range widened"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: config port-range: $out"
+  fail=$((fail + 1))
+fi
+
+echo "# reclaim --no-move"
+fresh_registry
+"$SLIPWAY" claim app1 100 >/dev/null                        # 4000-4099 (100-aligned)
+# Grow in place: 4000 is 200-aligned, 4100-4199 is free → OK.
+got=$("$SLIPWAY" reclaim app1 200 --no-move)
+assert_eq "$got" "4000 4199" "reclaim --no-move grows in place"
+# Shrink in place: 4000 is 50-aligned, no collisions → OK.
+got=$("$SLIPWAY" reclaim app1 50 --no-move)
+assert_eq "$got" "4000 4049" "reclaim --no-move shrinks in place"
+
+echo "# reclaim --no-move refuses when alignment/collision forces a move"
+fresh_registry
+"$SLIPWAY" claim app1 100 >/dev/null                        # 4000-4099
+"$SLIPWAY" claim app2 100 >/dev/null                        # 4100-4199
+# app1 growth to 200 would need 4000-4199, but app2 blocks.
+assert_exit 6 "reclaim --no-move refuses on collision (E_CONFLICT)" "$SLIPWAY" reclaim app1 200 --no-move
+# app1 is unchanged after the failed reclaim.
+assert_eq "$("$SLIPWAY" get app1)" "4000 4099" "app1 unchanged after failed --no-move reclaim"
+# Non-aligned starts can't reclaim in place at a larger alignment.
+fresh_registry
+"$SLIPWAY" claim app1 50 >/dev/null                         # 4000-4049
+"$SLIPWAY" claim padding 50 >/dev/null                      # 4050-4099
+"$SLIPWAY" reclaim padding 100 >/dev/null                   # padding moves to 4100-4199
+# Now claim into a non-aligned-to-200 start via reserved forcing:
+# Actually 4000 IS 200-aligned. Simpler test: use size 75 (not a power of 2).
+fresh_registry
+"$SLIPWAY" reserved add 4000 4049 pad --force >/dev/null
+"$SLIPWAY" claim app1 50 >/dev/null                         # 4050-4099 (50-aligned, not 100-aligned)
+assert_exit 6 "reclaim --no-move refuses on misalignment" "$SLIPWAY" reclaim app1 100 --no-move
+
+echo "# SLIPWAY_LIB override"
+fresh_registry
+altlib=$(mktemp -d)
+cp "$SCRIPT_DIR/../lib/slipway/commands.sh" "$altlib/my-cmds.sh"
+SLIPWAY_LIB="$altlib/my-cmds.sh" "$SLIPWAY" claim alt 100 >/dev/null
+assert_eq "$("$SLIPWAY" get alt)" "4000 4099" "SLIPWAY_LIB override resolves to custom path"
+assert_exit 1 "missing SLIPWAY_LIB dies clearly" env SLIPWAY_LIB=/no/such/file.sh "$SLIPWAY" list
+rm -rf "$altlib"
+
+echo "# SLIPWAY_DEBUG emits traces"
+fresh_registry
+dbg=$(SLIPWAY_DEBUG=1 "$SLIPWAY" claim app1 100 2>&1 >/dev/null)
+if [[ "$dbg" == *"slipway[debug]"* ]]; then
+  echo "  ok: SLIPWAY_DEBUG emits traces to stderr"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: SLIPWAY_DEBUG no traces: $dbg"
+  fail=$((fail + 1))
+fi
+
+echo "# allocator correctness under dense occupancy (regression for single-jq rewrite)"
+fresh_registry
+# Claim 20 apps back-to-back and verify they tile the range correctly,
+# skipping the 5000 and 7000 reserved ports.
+for i in $(seq 1 20); do "$SLIPWAY" claim "dense$i" 100 >/dev/null; done
+# Spot checks:
+assert_eq "$("$SLIPWAY" get dense1)"  "4000 4099" "first claim at range start"
+# After 10 claims of 100 at 4000-4999 we'd hit the 5000 reserved port.
+# dense11 should skip to 5100 (size 100 aligned; reserved 5000 lies in 5000-5099).
+assert_eq "$("$SLIPWAY" get dense11)" "5100 5199" "allocator skips reserved 5000"
+
 echo
 echo "passed: $pass, failed: $fail"
 [[ "$fail" -eq 0 ]]

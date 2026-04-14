@@ -66,14 +66,18 @@ resolves the library via its own path, following symlinks. Set
 
 ```
 slipway claim <app> <size> [--dry-run] [--json]     # reserve next free range
-slipway reclaim <app> <size> [--json]               # atomically release & re-claim at new size
+slipway reclaim <app> <size> [--no-move] [--json]   # release & re-claim at new size; --no-move fails if move needed
 slipway ensure <app> <size> [--json]                # claim-if-missing; noop if already at <size>
 slipway get <app> [--json]                          # print "START END" (exit 3 if unclaimed)
+slipway port <app> [offset]                         # print a single port (start+offset, range-checked)
 slipway release <app> [--if-claimed]                # free an app's range; --if-claimed = idempotent
 slipway list [--json|--tsv]                         # show all allocations
 slipway conflicts <port> [--json]                   # show who holds a port (exit 3 if free)
-slipway doctor                                      # sanity-check the registry
+slipway doctor [--repair]                           # sanity-check; --repair clears orphaned locks
 slipway caddy <app> [subdomain] [offset]            # emit a Caddyfile fragment for <app>
+slipway config [show]                               # show port_range + registry_version
+slipway config port-range <s> <e>                   # reconfigure port_range (refuses orphaning apps)
+slipway version                                     # print version
 slipway reserved [--json]                           # show system-reserved ports
 slipway reserved add <s> <e> [note] [--force]       # reserve a range (refuses app overlap without --force)
 slipway reserved remove <s>                         # un-reserve by start port
@@ -160,6 +164,12 @@ acquire via PID liveness check. To force-clear a wedged lock manually:
 `slipway` gives you *ports*. For human-friendly *names*, pair it with
 Caddy and `*.localhost` — see [docs/convention.md](docs/convention.md).
 macOS resolves `*.localhost` to `127.0.0.1` natively; no dnsmasq needed.
+
+## Docs
+
+- [CHANGELOG.md](CHANGELOG.md) — notable changes per release.
+- [docs/convention.md](docs/convention.md) — the `{env}.{app}.localhost` naming scheme and port-offset layout.
+- `man slipway` — full manual page (install via `make install-man`).
 
 ## License
 

@@ -1,10 +1,11 @@
 PREFIX ?= $(HOME)/.local
 BINDIR ?= $(PREFIX)/bin
 LIBDIR ?= $(PREFIX)/lib/slipway
+MANDIR ?= $(PREFIX)/share/man/man1
 BASH_COMPLETION_DIR ?= $(PREFIX)/etc/bash_completion.d
 ZSH_COMPLETION_DIR  ?= $(PREFIX)/share/zsh/site-functions
 
-.PHONY: install uninstall install-completions test lint help
+.PHONY: install uninstall install-completions install-man test lint help
 
 help:
 	@echo "slipway — machine-wide port-range registry"
@@ -25,6 +26,11 @@ install:
 	@echo "installed: $(BINDIR)/slipway + $(LIBDIR)/commands.sh"
 	@echo "make sure $(BINDIR) is on your PATH"
 
+install-man:
+	install -d "$(MANDIR)"
+	install -m 0644 man/slipway.1 "$(MANDIR)/slipway.1"
+	@echo "installed: $(MANDIR)/slipway.1"
+
 install-completions:
 	install -d "$(BASH_COMPLETION_DIR)" "$(ZSH_COMPLETION_DIR)"
 	install -m 0644 completions/slipway.bash "$(BASH_COMPLETION_DIR)/slipway"
@@ -35,10 +41,11 @@ install-completions:
 uninstall:
 	rm -f "$(BINDIR)/slipway" \
 	      "$(LIBDIR)/commands.sh" \
+	      "$(MANDIR)/slipway.1" \
 	      "$(BASH_COMPLETION_DIR)/slipway" \
 	      "$(ZSH_COMPLETION_DIR)/_slipway"
 	@rmdir "$(LIBDIR)" 2>/dev/null || true
-	@echo "removed: slipway + lib + completions"
+	@echo "removed: slipway + lib + man + completions"
 
 test:
 	@bash tests/test.sh
