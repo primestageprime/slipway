@@ -28,7 +28,7 @@ fragment for you:
 
 ```sh
 slipway caddy myapp > ~/.config/caddy/conf.d/myapp.Caddyfile        # offset 0
-slipway caddy myapp dev-api 1 >> ~/.config/caddy/conf.d/myapp.Caddyfile
+slipway caddy myapp dev-api 1 >> ~/.config/caddy/conf.d/myapp.Caddyfile   # needs size >= 2
 ```
 
 For hand-rolled fragments (e.g. TLS passthrough), write them directly:

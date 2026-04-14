@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) ))
   exit 1
 fi
 
-SLIPWAY_VERSION="0.2.0"
+readonly SLIPWAY_VERSION="0.2.0"
 REGISTRY="${SLIPWAY_REGISTRY:-$HOME/.config/slipway/registry.json}"
 REGISTRY_VERSION=1
 LOCK_TIMEOUT_DS="${SLIPWAY_LOCK_TIMEOUT_DS:-100}"  # tenths of a second
@@ -195,15 +195,15 @@ EOF
 # shellcheck source=../lib/slipway/commands.sh
 source "$SLIPWAY_LIB"
 
-[[ $# -ge 1 ]] || { ensure_registry; usage; }
+# `version` and help work without touching the registry, so users can
+# recover from a corrupt/unreadable registry by reading the help output.
+if (( $# == 0 )); then usage; fi
+case "$1" in
+  version|--version) echo "slipway $SLIPWAY_VERSION"; exit 0 ;;
+  -h|--help|help)    usage 0 ;;
+esac
+
 sub="$1"; shift || true
-
-# `version` works without touching the registry (useful when registry is broken).
-if [[ "$sub" == "version" || "$sub" == "--version" ]]; then
-  echo "slipway $SLIPWAY_VERSION"
-  exit 0
-fi
-
 ensure_registry
 case "$sub" in
   claim)     cmd_claim "$@" ;;
@@ -218,6 +218,5 @@ case "$sub" in
   caddy)     cmd_caddy "$@" ;;
   config)    cmd_config "$@" ;;
   reserved)  cmd_reserved "$@" ;;
-  -h|--help|help) usage 0 ;;
   *) usage ;;
 esac

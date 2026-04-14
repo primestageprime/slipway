@@ -462,6 +462,100 @@ else
   fail=$((fail + 1))
 fi
 
+echo "# allocator: exact fit at port_range.end vs one-past"
+fresh_registry
+# Shrink port_range + clear reserved to build a clean boundary scenario:
+# [4000, 4099] = exactly two size-50 slots (4000-4049, 4050-4099).
+"$SLIPWAY" reserved remove 5000 >/dev/null
+"$SLIPWAY" reserved remove 7000 >/dev/null
+"$SLIPWAY" config port-range 4000 4099 >/dev/null
+assert_eq "$("$SLIPWAY" claim edge1 50)" "4000 4049" "first 50-slot fits at range start"
+assert_eq "$("$SLIPWAY" claim edge2 50)" "4050 4099" "second 50-slot fits exactly at port_range.end"
+assert_exit 4 "one more 50-slot exhausts (E_EXHAUSTED)" "$SLIPWAY" claim edge3 50
+
+echo "# reclaim --no-move refuses when growth would exceed port_range.end"
+fresh_registry
+"$SLIPWAY" reserved remove 5000 >/dev/null
+"$SLIPWAY" reserved remove 7000 >/dev/null
+"$SLIPWAY" config port-range 4000 4199 >/dev/null
+"$SLIPWAY" claim app1 100 >/dev/null                # 4000-4099
+# Grow in place to 200 would want 4000-4199 — still fits exactly.
+"$SLIPWAY" reclaim app1 200 --no-move >/dev/null
+# Growing to 400 (4000 is 400-aligned) would want 4000-4399 — exceeds
+# port_range.end=4199 → E_EXHAUSTED (distinct from size-mismatch E_CONFLICT).
+assert_exit 4 "reclaim --no-move past port_range.end (E_EXHAUSTED)" "$SLIPWAY" reclaim app1 400 --no-move
+
+echo "# help and version work with a broken registry"
+# Corrupt-registry path should not block `help` or `version`.
+broken=$(mktemp)
+echo "this is not json" > "$broken"
+SLIPWAY_REGISTRY="$broken" "$SLIPWAY" version >/dev/null
+pass=$((pass + 1)); echo "  ok: version works with broken registry"
+SLIPWAY_REGISTRY="$broken" "$SLIPWAY" --help >/dev/null
+pass=$((pass + 1)); echo "  ok: --help works with broken registry"
+SLIPWAY_REGISTRY="$broken" "$SLIPWAY" help >/dev/null
+pass=$((pass + 1)); echo "  ok: help works with broken registry"
+rm -f "$broken"
+
+echo "# doctor --repair is a noop on healthy registry"
+fresh_registry
+out=$("$SLIPWAY" doctor --repair)
+if [[ "$out" == *"registry healthy"* ]] && [[ "$out" != *"repaired"* ]]; then
+  echo "  ok: --repair on healthy registry is a noop"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: --repair healthy: $out"
+  fail=$((fail + 1))
+fi
+
+echo "# doctor --repair refuses to clear a live lock"
+fresh_registry
+mkdir "$SLIPWAY_REGISTRY.lock"
+echo "$$" > "$SLIPWAY_REGISTRY.lock/pid"   # our own PID = live
+out=$("$SLIPWAY" doctor --repair)
+if [[ "$out" == *"live pid"* ]] && [[ -d "$SLIPWAY_REGISTRY.lock" ]]; then
+  echo "  ok: --repair leaves live lock alone"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: --repair live: $out (dir exists=$([[ -d "$SLIPWAY_REGISTRY.lock" ]] && echo yes || echo no))"
+  fail=$((fail + 1))
+fi
+rm -rf "$SLIPWAY_REGISTRY.lock"
+
+echo "# config port-range rejects invalid input"
+fresh_registry
+assert_exit 2 "config port-range rejects non-numeric" "$SLIPWAY" config port-range foo 9999
+assert_exit 2 "config port-range rejects reversed"    "$SLIPWAY" config port-range 9000 4000
+# Narrowing that still contains all claims and reserveds succeeds.
+"$SLIPWAY" reserved remove 5000 >/dev/null
+"$SLIPWAY" reserved remove 7000 >/dev/null
+"$SLIPWAY" claim narrow 100 >/dev/null              # 4000-4099
+"$SLIPWAY" config port-range 4000 5000 >/dev/null
+out=$("$SLIPWAY" config show)
+if [[ "$out" == *"port_range: 4000-5000"* ]]; then
+  echo "  ok: narrowing port_range that still contains apps"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: config narrow: $out"
+  fail=$((fail + 1))
+fi
+
+echo "# config port-range refuses to orphan reserved entries"
+fresh_registry
+# Reserved 5000 and 7000 are in the default registry.
+assert_exit 6 "config port-range orphaning reserved (E_CONFLICT)" "$SLIPWAY" config port-range 4000 4999
+
+echo "# port rejects non-integer offset"
+fresh_registry
+"$SLIPWAY" claim app1 10 >/dev/null
+assert_exit 2 "port with non-integer offset (E_USAGE)" "$SLIPWAY" port app1 abc
+
+echo "# ensure --json emits same shape on same-size noop"
+fresh_registry
+fresh=$("$SLIPWAY" ensure app1 100 --json)
+noop=$("$SLIPWAY"  ensure app1 100 --json)
+assert_eq "$fresh" "$noop" "ensure --json shape is stable between fresh claim and noop"
+
 echo "# allocator correctness under dense occupancy (regression for single-jq rewrite)"
 fresh_registry
 # Claim 20 apps back-to-back and verify they tile the range correctly,

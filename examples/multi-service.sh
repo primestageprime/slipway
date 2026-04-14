@@ -17,7 +17,7 @@ slipway ensure "$APP_NAME" "$APP_SIZE" >/dev/null
 
 # Each env occupies a 100-port slot at an offset from the claimed range.
 # `slipway port` handles the arithmetic (+ out-of-range check) for us.
-ENV_OFFSET=${ENV_OFFSET:-100}      # 0 for env "a", 100 for "b", 200 for "c", …
+ENV_OFFSET=${ENV_OFFSET:-0}        # 0 for env "a", 100 for "b", 200 for "c", …
 UI_PORT=$(slipway port "$APP_NAME" $((ENV_OFFSET + 0)))
 API_PORT=$(slipway port "$APP_NAME" $((ENV_OFFSET + 1)))
 POSTGRES_PORT=$(slipway port "$APP_NAME" $((ENV_OFFSET + 2)))

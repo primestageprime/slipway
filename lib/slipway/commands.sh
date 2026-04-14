@@ -183,11 +183,11 @@ cmd_release() {
 # Optional arg: app name to exclude from "taken" (for reclaim).
 #
 # Implementation: one jq invocation does the whole walk (prior versions
-# spawned 2N+1 jq processes per claim; that's pathological at N≫10).
+# spawned O(N) jq processes per claim — two per taken entry plus setup).
 allocate_range() {
   local size="$1" exclude="${2:-}"
   local out
-  out=$(jq -r --argjson sz "$size" --arg ex "$exclude" '
+  if ! out=$(jq -r --argjson sz "$size" --arg ex "$exclude" '
     def align_up(n): (((n + $sz - 1) / $sz) | floor) * $sz;
     . as $r
     | $r.port_range.start as $rs
@@ -203,15 +203,36 @@ allocate_range() {
     | if ($start + $sz - 1) > $re then "EXHAUSTED \($rs) \($re)"
       else "OK \($start) \($start + $sz - 1)"
       end
-  ' "$REGISTRY")
+  ' "$REGISTRY"); then
+    die "allocate_range: jq failed (registry corrupt?)"
+  fi
+  [[ -n "$out" ]] || die "allocate_range: jq produced no output"
   local status s e
   read -r status s e <<<"$out"
-  if [[ "$status" == "EXHAUSTED" ]]; then
-    die_code "$E_EXHAUSTED" "no free range of size $size in [$s,$e]"
-  fi
+  case "$status" in
+    EXHAUSTED) die_code "$E_EXHAUSTED" "no free range of size $size in [$s,$e]" ;;
+    OK) ;;
+    *) die "allocate_range: unexpected jq output: $out" ;;
+  esac
   ALLOC_START=$s
   ALLOC_END=$e
   debug "allocate_range: size=$size exclude='${exclude}' → $ALLOC_START-$ALLOC_END"
+}
+
+# Resolve an app's port at a given offset. Prints the port; dies with
+# specific exit codes (E_NOTFOUND, E_USAGE) on failure.
+_slipway_resolve_port() {
+  local app="$1" offset="${2:-0}"
+  if ! [[ "$offset" =~ ^[0-9]+$ ]]; then
+    die_code "$E_USAGE" "offset must be a non-negative integer"
+  fi
+  local start end
+  start=$(jq -r --arg a "$app" '.apps[$a].start // empty' "$REGISTRY")
+  [[ -n "$start" ]] || die_code "$E_NOTFOUND" "no allocation for '$app'"
+  end=$(jq -r --arg a "$app" '.apps[$a].end' "$REGISTRY")
+  local port=$(( start + offset ))
+  (( port <= end )) || die_code "$E_USAGE" "offset $offset puts port $port beyond app range ($start-$end)"
+  echo "$port"
 }
 
 cmd_claim() {
@@ -319,16 +340,7 @@ cmd_reclaim() {
 cmd_port() {
   local app="${1:-}" offset="${2:-0}"
   [[ -n "$app" ]] || die_code "$E_USAGE" "usage: slipway port <app> [offset]"
-  if ! [[ "$offset" =~ ^[0-9]+$ ]]; then
-    die_code "$E_USAGE" "offset must be a non-negative integer"
-  fi
-  local start end
-  start=$(jq -r --arg a "$app" '.apps[$a].start // empty' "$REGISTRY")
-  [[ -n "$start" ]] || die_code "$E_NOTFOUND" "no allocation for '$app'"
-  end=$(jq -r --arg a "$app" '.apps[$a].end' "$REGISTRY")
-  local port=$(( start + offset ))
-  (( port <= end )) || die_code "$E_USAGE" "offset $offset exceeds app range ($start-$end)"
-  echo "$port"
+  _slipway_resolve_port "$app" "$offset"
 }
 
 cmd_config() {
@@ -347,10 +359,12 @@ cmd_config() {
       acquire_lock
       local orphans
       orphans=$(jq -r --argjson s "$s" --argjson e "$e" '
-        [.apps | to_entries[] | select(.value.start < $s or .value.end > $e) | .key] | join(",")
+        [ (.apps | to_entries[] | select(.value.start < $s or .value.end > $e) | .key),
+          ((.reserved // [])[] | select(.start < $s or .end > $e) | "reserved(\(.start)-\(.end))")
+        ] | join(",")
       ' "$REGISTRY")
       if [[ -n "$orphans" ]]; then
-        die_code "$E_CONFLICT" "new port_range [$s,$e] would orphan apps: $orphans (release or reclaim first)"
+        die_code "$E_CONFLICT" "new port_range [$s,$e] would orphan: $orphans (release/reclaim apps or remove reserved entries first)"
       fi
       write_unlocked --argjson s "$s" --argjson e "$e" '.port_range = {start:$s, end:$e}'
       echo "port_range: $s-$e"
@@ -404,15 +418,8 @@ cmd_ensure() {
 cmd_caddy() {
   local app="${1:-}" subdomain="${2:-dev}" offset="${3:-0}"
   [[ -n "$app" ]] || die_code "$E_USAGE" "usage: slipway caddy <app> [subdomain] [offset]"
-  if ! [[ "$offset" =~ ^[0-9]+$ ]]; then
-    die_code "$E_USAGE" "offset must be a non-negative integer"
-  fi
-  local start end
-  start=$(jq -r --arg a "$app" '.apps[$a].start // empty' "$REGISTRY")
-  [[ -n "$start" ]] || die_code "$E_NOTFOUND" "no allocation for '$app'"
-  end=$(jq -r --arg a "$app" '.apps[$a].end' "$REGISTRY")
-  local port=$(( start + offset ))
-  (( port <= end )) || die_code "$E_USAGE" "offset $offset puts port $port beyond app range ($start-$end)"
+  local port
+  port=$(_slipway_resolve_port "$app" "$offset")
   cat <<EOF
 ${subdomain}.${app}.localhost {
   reverse_proxy localhost:${port}
@@ -441,8 +448,19 @@ cmd_doctor() {
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       echo "ok: lock held by live pid $pid"
     elif (( repair == 1 )); then
-      rm -rf "$lock" 2>/dev/null || die "cannot remove $lock (permissions?)"
-      echo "repaired: removed orphaned lock at $lock (pid=${pid:-<empty>})"
+      # Double-read pidfile to reduce (not eliminate) the TOCTOU where
+      # another process reaped the lock and took over between our reads.
+      local pid2
+      pid2=$(cat "$lock/pid" 2>/dev/null || true)
+      if [[ "$pid" != "$pid2" ]] || { [[ -n "$pid2" ]] && kill -0 "$pid2" 2>/dev/null; }; then
+        echo "ok: lock reclaimed by live process (pid=$pid2)"
+      else
+        local rm_err
+        if ! rm_err=$(rm -rf "$lock" 2>&1); then
+          die "cannot remove $lock: $rm_err"
+        fi
+        echo "repaired: removed orphaned lock at $lock (pid=${pid:-<empty>})"
+      fi
     else
       echo "WARN: orphaned lock at $lock (pid=${pid:-<empty>}); re-run with --repair or rm -rf"
       issues=$((issues + 1))

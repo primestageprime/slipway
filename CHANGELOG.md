@@ -42,8 +42,8 @@ All notable changes to slipway. Format loosely follows
   `lib/slipway/commands.sh` (sourced). `make install` places them as
   siblings; the binary resolves its lib via symlink-aware `$BASH_SOURCE`.
   Set `SLIPWAY_LIB` to override.
-- Allocator collapsed to a single `jq` invocation per `claim`/`reclaim`
-  (was O(N) jq processes per claim).
+- Allocator collapsed to a single `jq` invocation per `claim`/`reclaim`.
+  Previously spawned O(N) jq processes (two per taken entry plus setup).
 - Examples rewritten to use `ensure` + `slipway port` + `slipway caddy`
   instead of the manual idioms.
 
