@@ -21,7 +21,11 @@ load_port_range() {
 }
 
 write_caddy_fragment() {
-  cat > "$HOME/.config/caddy/conf.d/${APP_NAME}.Caddyfile" <<EOF
+  local caddy_dir="$HOME/.config/caddy/conf.d"
+  mkdir -p "$caddy_dir"
+  # Shell expands $UI_PORT; Caddyfile has no env-var expansion of its own,
+  # so we must interpolate here rather than rely on Caddy to do it.
+  cat > "$caddy_dir/${APP_NAME}.Caddyfile" <<EOF
 dev.${APP_NAME}.localhost {
   reverse_proxy localhost:${UI_PORT}
 }

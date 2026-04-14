@@ -55,10 +55,12 @@ Or just drop `bin/slipway` anywhere on your `PATH`.
 ## Usage
 
 ```
-slipway claim <app> <size>              # reserve next free range of <size> ports
+slipway claim <app> <size> [--dry-run]  # reserve next free range of <size> ports
+slipway reclaim <app> <size>            # atomically release & re-claim at new size
 slipway get <app>                       # print "START END" (exit 1 if unclaimed)
 slipway release <app>                   # free an app's range
 slipway list                            # show all allocations
+slipway conflicts <port>                # show who holds a port (exit 1 if free)
 slipway reserved                        # show system-reserved ports
 slipway reserved add <s> <e> [note]     # reserve a range (e.g. a port a daemon holds)
 slipway reserved remove <s>             # un-reserve by start port
@@ -105,7 +107,20 @@ fronted by Caddy).
 ```
 
 `reserved` is honored by `claim` (system ports that must be avoided).
-Edit the file directly to change `port_range` or `reserved`.
+Edit the file directly to change `port_range` or `reserved`. The
+`registry_version` field is managed by slipway; don't set it by hand.
+
+## Concurrency
+
+`slipway` serializes mutating operations (`claim`, `reclaim`, `release`,
+`reserved add/remove`) with a lockdir at `$SLIPWAY_REGISTRY.lock`. Parallel
+invocations from multiple shells or processes are safe — they queue rather
+than racing. Read-only commands (`get`, `list`, `conflicts`) skip the lock.
+
+If a slipway process is killed uncleanly, the lock is removed on next
+acquire via PID liveness check. To force-clear a wedged lock manually:
+`rm -rf "$SLIPWAY_REGISTRY.lock"`. Tune the acquire timeout with
+`SLIPWAY_LOCK_TIMEOUT_DS` (tenths of seconds; default 100 = 10s).
 
 ## Addressing convention
 

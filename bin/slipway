@@ -1,19 +1,29 @@
 #!/usr/bin/env bash
 # slipway — machine-wide port-range registry for local dev.
 # https://github.com/primestageprime/slipway
+# shellcheck disable=SC2016  # jq programs use $var for jq-level vars, not shell expansion
 set -euo pipefail
 
+if (( BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) )); then
+  echo "slipway: bash 3.2+ required (found ${BASH_VERSION})" >&2
+  exit 1
+fi
+
 REGISTRY="${SLIPWAY_REGISTRY:-$HOME/.config/slipway/registry.json}"
+REGISTRY_VERSION=1
+LOCK_TIMEOUT_DS="${SLIPWAY_LOCK_TIMEOUT_DS:-100}"  # tenths of a second
 
 die() { echo "slipway: $*" >&2; exit 1; }
 
 command -v jq >/dev/null || die "jq not found in PATH"
 
 ensure_registry() {
-  [[ -f "$REGISTRY" ]] && return
-  mkdir -p "$(dirname "$REGISTRY")"
-  cat > "$REGISTRY" <<'JSON'
+  umask 0022
+  if [[ ! -f "$REGISTRY" ]]; then
+    mkdir -p "$(dirname "$REGISTRY")"
+    cat > "$REGISTRY" <<JSON
 {
+  "registry_version": $REGISTRY_VERSION,
   "port_range": { "start": 4000, "end": 9999 },
   "reserved": [
     { "start": 5000, "end": 5000, "note": "macOS AirPlay Receiver (ControlCenter)" },
@@ -22,11 +32,72 @@ ensure_registry() {
   "apps": {}
 }
 JSON
+  fi
+  migrate_registry
+  validate_registry
 }
 
-write() {
-  local tmp="${REGISTRY}.tmp"
+validate_registry() {
+  jq -e '
+    (.port_range.start | type == "number") and
+    (.port_range.end   | type == "number") and
+    (.port_range.end >= .port_range.start) and
+    ((.apps // {})     | type == "object") and
+    ((.reserved // []) | type == "array")
+  ' "$REGISTRY" >/dev/null 2>&1 || die "registry schema invalid: $REGISTRY"
+}
+
+migrate_registry() {
+  # Add missing registry_version to pre-versioned files. Future schema bumps
+  # branch on the stored value here.
+  local v
+  v=$(jq -r '.registry_version // 0' "$REGISTRY")
+  if (( v < REGISTRY_VERSION )); then
+    write_unlocked --argjson v "$REGISTRY_VERSION" '.registry_version = $v'
+  elif (( v > REGISTRY_VERSION )); then
+    die "registry_version $v is newer than this slipway (knows $REGISTRY_VERSION); upgrade slipway"
+  fi
+}
+
+# Atomic-ish locking via mkdir (POSIX atomic). flock is not available on
+# macOS by default, so we use a lockdir with timeout + stale-PID detection.
+LOCK_HELD=0
+acquire_lock() {
+  (( LOCK_HELD == 0 )) || return 0
+  local lock="${REGISTRY}.lock"
+  local i=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [[ -f "$lock/pid" ]]; then
+      local pid
+      pid=$(cat "$lock/pid" 2>/dev/null || echo "")
+      if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+        rm -rf "$lock" 2>/dev/null || true
+        continue
+      fi
+    fi
+    if (( i >= LOCK_TIMEOUT_DS )); then
+      die "could not acquire lock at $lock after $((LOCK_TIMEOUT_DS/10))s (stale? rm -rf it)"
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  echo "$$" > "$lock/pid"
+  LOCK_HELD=1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$lock' 2>/dev/null || true" EXIT INT TERM HUP
+}
+
+# Unlocked writer — used by migrate_registry (single-process bootstrap) and
+# by callers that already hold the lock via acquire_lock.
+write_unlocked() {
+  local tmp="${REGISTRY}.tmp.$$"
   jq "$@" "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+}
+
+# Locked writer — acquires the lock if not already held.
+write() {
+  acquire_lock
+  write_unlocked "$@"
 }
 
 usage() {
@@ -34,16 +105,19 @@ usage() {
 slipway — hand out port ranges to local dev apps so they don't collide.
 
 Usage:
-  slipway claim <app> <size>   Reserve the next free range of <size> ports
-  slipway get <app>            Print "START END" for <app> (exit 1 if unclaimed)
-  slipway release <app>        Free an app's range
-  slipway list                         Show all current allocations
-  slipway reserved [list]              Show system-reserved ports
-  slipway reserved add <s> <e> [note]  Reserve a port range
-  slipway reserved remove <s>          Remove a reserved entry by start port
+  slipway claim <app> <size> [--dry-run]  Reserve the next free range of <size> ports
+  slipway reclaim <app> <size>            Atomically release & re-claim <app> at <size>
+  slipway get <app>                       Print "START END" for <app> (exit 1 if unclaimed)
+  slipway release <app>                   Free an app's range
+  slipway list                            Show all current allocations
+  slipway conflicts <port>                Show who holds <port> (app or reserved), exit 1 if free
+  slipway reserved [list]                 Show system-reserved ports
+  slipway reserved add <s> <e> [note]     Reserve a port range
+  slipway reserved remove <s>             Remove a reserved entry by start port
 
 Env:
   SLIPWAY_REGISTRY             Override registry path (default: ~/.config/slipway/registry.json)
+  SLIPWAY_LOCK_TIMEOUT_DS      Lock acquisition timeout in tenths of seconds (default: 100)
 EOF
   exit "${1:-1}"
 }
@@ -66,6 +140,28 @@ cmd_list() {
   ' "$REGISTRY" | column -t -s $'\t'
 }
 
+cmd_conflicts() {
+  local port="${1:-}"
+  [[ -n "$port" ]] || die "usage: slipway conflicts <port>"
+  if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+    die "port must be an integer"
+  fi
+  local hits
+  hits=$(jq -r --argjson p "$port" '
+    [ (.apps | to_entries[] | select(.value.start <= $p and .value.end >= $p)
+        | "app\t" + .key + "\t" + (.value.start|tostring) + "-" + (.value.end|tostring)),
+      ((.reserved // [])[] | select(.start <= $p and .end >= $p)
+        | "reserved\t(reserved)\t" + (.start|tostring) + "-" + (.end|tostring)
+          + (if .note then "\t" + .note else "" end))
+    ] | .[]
+  ' "$REGISTRY")
+  if [[ -z "$hits" ]]; then
+    echo "port $port is free"
+    return 1
+  fi
+  printf '%s\n' "$hits" | column -t -s $'\t'
+}
+
 cmd_reserved() {
   local op="${1:-list}"
   case "$op" in
@@ -79,10 +175,12 @@ cmd_reserved() {
     add)
       local start="${2:-}" end="${3:-}" note="${4:-}"
       [[ -n "$start" && -n "$end" ]] || die "usage: slipway reserved add <start> <end> [note]"
-      [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] \
-        || die "start and end must be integers"
+      if ! [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]]; then
+        die "start and end must be integers"
+      fi
       (( end >= start )) || die "end must be >= start"
-      write --argjson s "$start" --argjson e "$end" --arg n "$note" \
+      acquire_lock
+      write_unlocked --argjson s "$start" --argjson e "$end" --arg n "$note" \
         '.reserved = ((.reserved // []) + [{start:$s, end:$e} + (if $n == "" then {} else {note:$n} end)])
          | .reserved |= sort_by(.start)'
       echo "reserved: $start-$end${note:+ ($note)}"
@@ -90,10 +188,13 @@ cmd_reserved() {
     remove|rm)
       local start="${2:-}"
       [[ -n "$start" ]] || die "usage: slipway reserved remove <start>"
-      [[ "$start" =~ ^[0-9]+$ ]] || die "start must be an integer"
+      if ! [[ "$start" =~ ^[0-9]+$ ]]; then
+        die "start must be an integer"
+      fi
+      acquire_lock
       jq -e --argjson s "$start" '(.reserved // []) | any(.start == $s)' "$REGISTRY" >/dev/null \
         || die "no reserved entry starting at $start"
-      write --argjson s "$start" '.reserved = ((.reserved // []) | map(select(.start != $s)))'
+      write_unlocked --argjson s "$start" '.reserved = ((.reserved // []) | map(select(.start != $s)))'
       echo "removed reserved entry starting at $start"
       ;;
     *)
@@ -104,33 +205,29 @@ cmd_reserved() {
 
 cmd_release() {
   local app="$1"
+  acquire_lock
   jq -e --arg a "$app" '.apps[$a]' "$REGISTRY" >/dev/null \
     || die "no allocation for '$app'"
-  write --arg a "$app" 'del(.apps[$a])'
+  write_unlocked --arg a "$app" 'del(.apps[$a])'
   echo "released: $app"
 }
 
-cmd_claim() {
-  local app="$1" size="${2:-}"
-  [[ -n "$size" ]] || usage
-  [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )) || die "size must be a positive integer"
-
-  if jq -e --arg a "$app" '.apps[$a]' "$REGISTRY" >/dev/null; then
-    die "'$app' already claimed; use 'release' first or 'get' to look it up"
-  fi
-
+# Core allocator: finds the next free size-aligned range.
+# Sets globals: ALLOC_START, ALLOC_END. Dies on exhaustion.
+# Optional arg: app name to exclude from "taken" (for reclaim).
+allocate_range() {
+  local size="$1" exclude="${2:-}"
   local range_start range_end
   range_start=$(jq -r '.port_range.start' "$REGISTRY")
   range_end=$(jq -r '.port_range.end' "$REGISTRY")
 
-  # Taken = apps ∪ reserved, sorted by start.
   local taken
-  taken=$(jq -c '
-    ([.apps[] | {start, end}] + ((.reserved // []) | map({start, end})))
+  taken=$(jq -c --arg ex "$exclude" '
+    ([.apps | to_entries[] | select(.key != $ex) | .value | {start, end}]
+     + ((.reserved // []) | map({start, end})))
     | sort_by(.start)
   ' "$REGISTRY")
 
-  # Align candidate up to a multiple of size, then walk taken ranges.
   local candidate=$range_start
   candidate=$(( ((candidate + size - 1) / size) * size ))
 
@@ -149,22 +246,80 @@ cmd_claim() {
 
   local new_end=$(( candidate + size - 1 ))
   (( new_end <= range_end )) || die "no free range of size $size in [$range_start,$range_end]"
+  ALLOC_START=$candidate
+  ALLOC_END=$new_end
+}
 
-  write --arg a "$app" --argjson s "$candidate" --argjson e "$new_end" \
+cmd_claim() {
+  local app="" size="" dry_run=0
+  while (( $# )); do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --) shift; break ;;
+      -*) die "unknown flag: $1" ;;
+      *)
+        if [[ -z "$app" ]]; then app="$1"
+        elif [[ -z "$size" ]]; then size="$1"
+        else die "too many arguments to claim"
+        fi
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$app" && -n "$size" ]] || usage
+  if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size <= 0 )); then
+    die "size must be a positive integer"
+  fi
+
+  if (( dry_run == 0 )); then
+    acquire_lock
+  fi
+
+  if jq -e --arg a "$app" '.apps[$a]' "$REGISTRY" >/dev/null; then
+    die "'$app' already claimed; use 'release'/'reclaim' or 'get' to look it up"
+  fi
+
+  allocate_range "$size"
+
+  if (( dry_run )); then
+    echo "would claim: $ALLOC_START $ALLOC_END"
+    return 0
+  fi
+
+  write_unlocked --arg a "$app" --argjson s "$ALLOC_START" --argjson e "$ALLOC_END" \
     '.apps[$a] = {start: $s, end: $e}'
+  echo "$ALLOC_START $ALLOC_END"
+}
 
-  echo "$candidate $new_end"
+cmd_reclaim() {
+  local app="${1:-}" size="${2:-}"
+  [[ -n "$app" && -n "$size" ]] || die "usage: slipway reclaim <app> <size>"
+  if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size <= 0 )); then
+    die "size must be a positive integer"
+  fi
+
+  acquire_lock
+  jq -e --arg a "$app" '.apps[$a]' "$REGISTRY" >/dev/null \
+    || die "no allocation for '$app' (use 'claim' for new apps)"
+
+  allocate_range "$size" "$app"
+
+  write_unlocked --arg a "$app" --argjson s "$ALLOC_START" --argjson e "$ALLOC_END" \
+    '.apps[$a] = {start: $s, end: $e}'
+  echo "$ALLOC_START $ALLOC_END"
 }
 
 ensure_registry
 [[ $# -ge 1 ]] || usage
 sub="$1"; shift || true
 case "$sub" in
-  claim)    [[ $# -eq 2 ]] || usage; cmd_claim "$@" ;;
-  get)      [[ $# -eq 1 ]] || usage; cmd_get "$@" ;;
-  release)  [[ $# -eq 1 ]] || usage; cmd_release "$@" ;;
-  list)     [[ $# -eq 0 ]] || usage; cmd_list ;;
-  reserved) cmd_reserved "$@" ;;
+  claim)     cmd_claim "$@" ;;
+  reclaim)   [[ $# -eq 2 ]] || usage; cmd_reclaim "$@" ;;
+  get)       [[ $# -eq 1 ]] || usage; cmd_get "$@" ;;
+  release)   [[ $# -eq 1 ]] || usage; cmd_release "$@" ;;
+  list)      [[ $# -eq 0 ]] || usage; cmd_list ;;
+  conflicts) [[ $# -eq 1 ]] || usage; cmd_conflicts "$@" ;;
+  reserved)  cmd_reserved "$@" ;;
   -h|--help|help) usage 0 ;;
   *) usage ;;
 esac
