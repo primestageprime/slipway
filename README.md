@@ -35,13 +35,22 @@ to claim a stable range per app. Combine with Caddy + `*.localhost` (see
 
 Requires `bash`, `jq`, and `column`.
 
+**Homebrew (macOS / Linux):**
+
+```sh
+brew tap primestageprime/tap
+brew install slipway
+```
+
+**From source:**
+
 ```sh
 git clone https://github.com/primestageprime/slipway
 cd slipway
 make install        # → ~/.local/bin/slipway
 ```
 
-Or drop `bin/slipway` anywhere on your `PATH`.
+Or just drop `bin/slipway` anywhere on your `PATH`.
 
 ## Usage
 
