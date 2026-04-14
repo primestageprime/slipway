@@ -38,60 +38,92 @@ JSON
 }
 
 validate_registry() {
-  jq -e '
+  # Intentionally let jq's stderr through so real failures (missing jq
+  # binary, unreadable file, malformed JSON) surface before we die.
+  if ! jq -e '
     (.port_range.start | type == "number") and
     (.port_range.end   | type == "number") and
     (.port_range.end >= .port_range.start) and
     ((.apps // {})     | type == "object") and
     ((.reserved // []) | type == "array")
-  ' "$REGISTRY" >/dev/null 2>&1 || die "registry schema invalid: $REGISTRY"
+  ' "$REGISTRY" >/dev/null; then
+    die "registry schema invalid: $REGISTRY"
+  fi
 }
 
 migrate_registry() {
   # Add missing registry_version to pre-versioned files. Future schema bumps
-  # branch on the stored value here.
+  # branch on the stored value here. Must take the lock before writing, and
+  # re-read under the lock in case a parallel invocation migrated first.
   local v
   v=$(jq -r '.registry_version // 0' "$REGISTRY")
-  if (( v < REGISTRY_VERSION )); then
-    write_unlocked --argjson v "$REGISTRY_VERSION" '.registry_version = $v'
-  elif (( v > REGISTRY_VERSION )); then
+  if (( v > REGISTRY_VERSION )); then
     die "registry_version $v is newer than this slipway (knows $REGISTRY_VERSION); upgrade slipway"
+  fi
+  if (( v < REGISTRY_VERSION )); then
+    acquire_lock
+    v=$(jq -r '.registry_version // 0' "$REGISTRY")
+    if (( v < REGISTRY_VERSION )); then
+      write_unlocked --argjson vv "$REGISTRY_VERSION" '.registry_version = $vv'
+    fi
   fi
 }
 
 # Atomic-ish locking via mkdir (POSIX atomic). flock is not available on
-# macOS by default, so we use a lockdir with timeout + stale-PID detection.
+# macOS by default, so we use a lockdir with PID liveness + double-read
+# TOCTOU guard for stale recovery. Not perfect against adversarial
+# contention, but adequate for a dev tool.
 LOCK_HELD=0
+_slipway_cleanup() {
+  if (( LOCK_HELD == 1 )); then
+    rm -rf "${REGISTRY}.lock" 2>/dev/null || true
+  fi
+  return 0
+}
+trap _slipway_cleanup EXIT INT TERM HUP
+
 acquire_lock() {
   (( LOCK_HELD == 0 )) || return 0
   local lock="${REGISTRY}.lock"
-  local i=0
+  local i=0 pid1 pid2
   while ! mkdir "$lock" 2>/dev/null; do
-    if [[ -f "$lock/pid" ]]; then
-      local pid
-      pid=$(cat "$lock/pid" 2>/dev/null || echo "")
-      if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-        rm -rf "$lock" 2>/dev/null || true
+    pid1=$(cat "$lock/pid" 2>/dev/null || true)
+    if [[ -n "$pid1" ]] && ! kill -0 "$pid1" 2>/dev/null; then
+      # Holder looks dead. Double-read pid to guard against the case where
+      # another process reaped and took over between our reads.
+      sleep 0.05
+      pid2=$(cat "$lock/pid" 2>/dev/null || true)
+      if [[ "$pid1" == "$pid2" ]] && ! kill -0 "$pid1" 2>/dev/null; then
+        rm -rf "$lock" 2>/dev/null || die "cannot clear stale lock $lock (permissions?)"
         continue
       fi
     fi
+    # Empty pidfile (holder mid-init) or live holder: wait it out.
     if (( i >= LOCK_TIMEOUT_DS )); then
       die "could not acquire lock at $lock after $((LOCK_TIMEOUT_DS/10))s (stale? rm -rf it)"
     fi
     sleep 0.1
     i=$((i + 1))
   done
-  echo "$$" > "$lock/pid"
+  if ! echo "$$" > "$lock/pid"; then
+    rm -rf "$lock" 2>/dev/null || true
+    die "failed to write lock pidfile at $lock/pid"
+  fi
   LOCK_HELD=1
-  # shellcheck disable=SC2064
-  trap "rm -rf '$lock' 2>/dev/null || true" EXIT INT TERM HUP
 }
 
-# Unlocked writer — used by migrate_registry (single-process bootstrap) and
-# by callers that already hold the lock via acquire_lock.
+# Unlocked writer — callers must already hold the lock (or accept the race,
+# as migrate_registry does only after itself acquiring the lock).
 write_unlocked() {
   local tmp="${REGISTRY}.tmp.$$"
-  jq "$@" "$REGISTRY" > "$tmp" && mv "$tmp" "$REGISTRY"
+  if ! jq "$@" "$REGISTRY" > "$tmp"; then
+    rm -f "$tmp"
+    die "jq transform failed on $REGISTRY"
+  fi
+  if ! mv "$tmp" "$REGISTRY"; then
+    rm -f "$tmp"
+    die "failed to replace $REGISTRY (permissions? disk full?)"
+  fi
 }
 
 # Locked writer — acquires the lock if not already held.

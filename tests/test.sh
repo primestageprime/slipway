@@ -117,11 +117,13 @@ assert_exit 1 "conflicts requires numeric port" "$SLIPWAY" conflicts abc
 echo "# concurrent claims do not overlap"
 fresh_registry
 # Spawn N parallel claims; verify no two ranges overlap and all succeed.
-N=10
+# N is large enough that without locking, two processes routinely hit the
+# same read-compute-write window and either overlap or lose a write.
+N=30
 pids=()
 outdir=$(mktemp -d)
 for i in $(seq 1 $N); do
-  ("$SLIPWAY" claim "concurrent$i" 100 > "$outdir/$i" 2>&1) &
+  ("$SLIPWAY" claim "concurrent$i" 10 > "$outdir/$i" 2>&1) &
   pids+=("$!")
 done
 all_ok=0
@@ -160,6 +162,73 @@ fresh_registry
 tmpreg=$(mktemp)
 jq '.registry_version = 99' "$SLIPWAY_REGISTRY" > "$tmpreg" && mv "$tmpreg" "$SLIPWAY_REGISTRY"
 assert_exit 1 "future registry_version rejected" "$SLIPWAY" list
+
+echo "# populated v0 migration preserves data"
+fresh_registry
+"$SLIPWAY" claim keep1 100 >/dev/null
+"$SLIPWAY" claim keep2 200 >/dev/null
+"$SLIPWAY" reserved add 8000 8010 testnote >/dev/null
+before=$(jq -S '.apps, .reserved, .port_range' "$SLIPWAY_REGISTRY")
+tmpreg=$(mktemp)
+jq 'del(.registry_version)' "$SLIPWAY_REGISTRY" > "$tmpreg" && mv "$tmpreg" "$SLIPWAY_REGISTRY"
+"$SLIPWAY" list >/dev/null
+assert_eq "$(jq -r '.registry_version' "$SLIPWAY_REGISTRY")" "1" "populated migration bumps version"
+after=$(jq -S '.apps, .reserved, .port_range' "$SLIPWAY_REGISTRY")
+assert_eq "$before" "$after" "populated migration preserves apps/reserved/port_range"
+
+echo "# dry-run rejects already-claimed app"
+fresh_registry
+"$SLIPWAY" claim already 100 >/dev/null
+assert_exit 1 "dry-run on claimed app fails" "$SLIPWAY" claim already 100 --dry-run
+
+echo "# reclaim same size is idempotent"
+fresh_registry
+"$SLIPWAY" claim app1 100 >/dev/null
+before=$(jq -S '.apps' "$SLIPWAY_REGISTRY")
+got=$("$SLIPWAY" reclaim app1 100)
+assert_eq "$got" "4000 4099" "reclaim same size returns same range"
+after=$(jq -S '.apps' "$SLIPWAY_REGISTRY")
+assert_eq "$before" "$after" "same-size reclaim leaves registry unchanged"
+
+echo "# reclaim preserves original when no room"
+fresh_registry
+"$SLIPWAY" claim app1 100 >/dev/null
+assert_exit 1 "reclaim with impossible size fails" "$SLIPWAY" reclaim app1 999999
+assert_eq "$("$SLIPWAY" get app1)" "4000 4099" "app1 range preserved after failed reclaim"
+
+echo "# stale lock recovery"
+fresh_registry
+mkdir "$SLIPWAY_REGISTRY.lock"
+echo "9999999" > "$SLIPWAY_REGISTRY.lock/pid"  # PID that cannot exist
+assert_eq "$("$SLIPWAY" claim app1 100)" "4000 4099" "claim reclaims stale lock"
+if [[ ! -d "$SLIPWAY_REGISTRY.lock" ]]; then
+  echo "  ok: stale lock cleared after use"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: stale lock not cleared"
+  fail=$((fail + 1))
+fi
+
+echo "# lock timeout on live holder"
+fresh_registry
+mkdir "$SLIPWAY_REGISTRY.lock"
+echo "$$" > "$SLIPWAY_REGISTRY.lock/pid"  # our own PID (alive)
+SLIPWAY_LOCK_TIMEOUT_DS=3 assert_exit 1 "acquire times out on live holder" "$SLIPWAY" claim app1 100
+rm -rf "$SLIPWAY_REGISTRY.lock"
+
+echo "# conflicts edge cases"
+fresh_registry
+"$SLIPWAY" reserved add 8000 8010 "big reservation" >/dev/null
+out=$("$SLIPWAY" conflicts 8005 2>&1)
+if [[ "$out" == *"big reservation"* ]]; then
+  echo "  ok: conflicts shows reserved note"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: note missing from conflicts output: $out"
+  fail=$((fail + 1))
+fi
+# A port above port_range.end (9999) with no claim/reservation → free.
+assert_exit 1 "conflicts on out-of-range port reports free" "$SLIPWAY" conflicts 15000
 
 echo
 echo "passed: $pass, failed: $fail"
