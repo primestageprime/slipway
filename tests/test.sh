@@ -507,6 +507,14 @@ echo "# claim with reserved port rejected"
 fresh_registry
 assert_exit 6 "claim on reserved port rejected (E_CONFLICT)" "$SLIPWAY" claim blocked --port 5000
 
+echo "# reserved add conflicting with existing claim"
+fresh_registry
+"$SLIPWAY" claim app1 --port 8080 >/dev/null
+assert_exit 6 "reserved add on claimed port rejected (E_CONFLICT)" "$SLIPWAY" reserved add 8080 "conflict"
+# Verify the reservation was not added
+got=$(jq -r '[.reserved[] | select(.port == 8080)] | length' "$SLIPWAY_REGISTRY")
+assert_eq "$got" "0" "conflicting reservation not persisted"
+
 echo
 echo "passed: $pass, failed: $fail"
 [[ "$fail" -eq 0 ]]

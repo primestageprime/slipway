@@ -8,15 +8,13 @@
 allocate_port() {
   local out
   if ! out=$(jq -r '
-    .auto_pool.start as $lo
+    ([ (.claims // {} | .[].port), ((.reserved // [])[] | .port) ]
+     | map({(tostring): true}) | add // {}) as $taken
+    | .auto_pool.start as $lo
     | .auto_pool.end as $hi
-    | ([.claims | to_entries[].value.port] + [(.reserved // [])[].port]) as $taken
-    | (reduce range($lo; $hi + 1) as $p (null;
-        if . != null then .
-        elif ($taken | index($p)) then null
-        else $p
-        end))
-    | if . == null then "EXHAUSTED"
+    | first(range($lo; $hi + 1) | select($taken[tostring] | not))
+    // null
+    | if . == null then "EXHAUSTED \($lo) \($hi)"
       else "OK \(.)"
       end
   ' "$REGISTRY"); then
@@ -243,6 +241,7 @@ cmd_reserved() {
       local positional=()
       while (( $# )); do
         case "$1" in
+          -*) die_code "$E_USAGE" "unknown flag: $1" ;;
           *) positional+=("$1"); shift ;;
         esac
       done
@@ -252,6 +251,14 @@ cmd_reserved() {
         die_code "$E_USAGE" "port must be an integer"
       fi
       acquire_lock
+      # Check for conflicts with existing claims
+      local claim_conflict
+      claim_conflict=$(jq -r --argjson p "$port_arg" '
+        .claims // {} | to_entries[] | select(.value.port == $p) | .key
+      ' "$REGISTRY")
+      if [[ -n "$claim_conflict" ]]; then
+        die_code "$E_CONFLICT" "port $port_arg is claimed by '$claim_conflict'"
+      fi
       # Check for duplicate reserved port
       if jq -e --argjson p "$port_arg" '(.reserved // []) | any(.port == $p)' "$REGISTRY" >/dev/null 2>&1; then
         die_code "$E_CONFLICT" "port $port_arg is already reserved"
@@ -293,6 +300,14 @@ cmd_config() {
       fi
       (( e >= s )) || die_code "$E_USAGE" "end must be >= start"
       acquire_lock
+      local outside
+      outside=$(jq -r --argjson s "$s" --argjson e "$e" '
+        [.claims // {} | to_entries[] | select(.value.port < $s or .value.port > $e) | .key]
+        | join(", ")
+      ' "$REGISTRY")
+      if [[ -n "$outside" ]]; then
+        echo "note: claims outside new auto_pool: $outside" >&2
+      fi
       write_unlocked --argjson s "$s" --argjson e "$e" '.auto_pool = {start:$s, end:$e}'
       echo "auto_pool: $s-$e"
       ;;
@@ -308,6 +323,7 @@ cmd_check() {
   local port
   port=$(jq -r --arg n "$name" '.claims[$n].port // empty' "$REGISTRY")
   [[ -n "$port" ]] || die_code "$E_NOTFOUND" "no claim for '$name'"
+  command -v lsof >/dev/null || die "lsof not found in PATH (required for port checks)"
 
   local pid_info
   pid_info=$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)
@@ -347,7 +363,10 @@ cmd_doctor() {
       if [[ "$pid" != "$pid2" ]] || { [[ -n "$pid2" ]] && kill -0 "$pid2" 2>/dev/null; }; then
         echo "ok: lock reclaimed by live process (pid=$pid2)"
       else
-        rm -rf "$lock" 2>/dev/null || die "cannot remove $lock"
+        local rm_err
+        if ! rm_err=$(rm -rf "$lock" 2>&1); then
+          die "cannot remove $lock: $rm_err"
+        fi
         echo "repaired: removed orphaned lock at $lock (pid=${pid:-<empty>})"
       fi
     else
@@ -377,61 +396,66 @@ cmd_doctor() {
 
   # 3. Scan listening ports
   echo "--- listening ports ---"
-  local listeners
-  listeners=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null \
-    | awk 'NR>1 { split($9, a, ":"); port=a[length(a)]; if (port+0 > 1024) print port, $1, $2 }' \
-    | sort -t' ' -k1 -n -u || true)
-
-  if [[ -z "$listeners" ]]; then
-    echo "  (no TCP listeners above 1024)"
+  if ! command -v lsof >/dev/null; then
+    echo "  WARN: lsof not found; skipping port scans"
+    issues=$((issues + 1))
   else
-    local claimed_json reserved_json
-    claimed_json=$(jq -c '[.claims // {} | to_entries[] | {(.value.port|tostring): .key}] | add // {}' "$REGISTRY")
-    reserved_json=$(jq -c '[(.reserved // [])[] | {(.port|tostring): (.note // "reserved")}] | add // {}' "$REGISTRY")
+    local listeners
+    listeners=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null \
+      | awk 'NR>1 { split($9, a, ":"); port=a[length(a)]; if (port+0 > 1024) print port, $1, $2 }' \
+      | sort -t' ' -k1 -n -u || true)
 
-    local unknown_count=0
-    while read -r port proc pid; do
-      local owner
-      owner=$(jq -r --arg p "$port" '.[$p] // empty' <<<"$claimed_json")
-      if [[ -n "$owner" ]]; then
-        echo "  ok: :$port — $owner ($proc, pid $pid)"
-        continue
-      fi
-      owner=$(jq -r --arg p "$port" '.[$p] // empty' <<<"$reserved_json")
-      if [[ -n "$owner" ]]; then
-        echo "  ok: :$port — reserved ($owner) ($proc, pid $pid)"
-        continue
-      fi
-      echo "  UNKNOWN: :$port — $proc (pid $pid) — not claimed or reserved"
-      unknown_count=$((unknown_count + 1))
-    done <<<"$listeners"
-
-    if (( unknown_count > 0 )); then
-      echo "  $unknown_count unknown listener(s) — consider: slipway claim <name> --port <N>"
-      issues=$((issues + 1))
+    if [[ -z "$listeners" ]]; then
+      echo "  (no TCP listeners above 1024)"
     else
-      echo "  all listeners accounted for"
-    fi
-  fi
+      local claimed_json reserved_json
+      claimed_json=$(jq -c '[.claims // {} | to_entries[] | {(.value.port|tostring): .key}] | add // {}' "$REGISTRY")
+      reserved_json=$(jq -c '[(.reserved // [])[] | {(.port|tostring): (.note // "reserved")}] | add // {}' "$REGISTRY")
 
-  # 4. Stale claims
-  echo "--- stale claims ---"
-  local stale_count=0
-  local claim_ports
-  claim_ports=$(jq -r '.claims // {} | to_entries[] | "\(.key) \(.value.port)"' "$REGISTRY")
-  if [[ -z "$claim_ports" ]]; then
-    echo "  (no claims)"
-  else
-    while read -r name port; do
-      local pid_info
-      pid_info=$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)
-      if [[ -z "$pid_info" ]]; then
-        echo "  idle: :$port — $name (nothing listening)"
-        stale_count=$((stale_count + 1))
+      local unknown_count=0
+      while read -r port proc pid; do
+        local owner
+        owner=$(jq -r --arg p "$port" '.[$p] // empty' <<<"$claimed_json")
+        if [[ -n "$owner" ]]; then
+          echo "  ok: :$port — $owner ($proc, pid $pid)"
+          continue
+        fi
+        owner=$(jq -r --arg p "$port" '.[$p] // empty' <<<"$reserved_json")
+        if [[ -n "$owner" ]]; then
+          echo "  ok: :$port — reserved ($owner) ($proc, pid $pid)"
+          continue
+        fi
+        echo "  UNKNOWN: :$port — $proc (pid $pid) — not claimed or reserved"
+        unknown_count=$((unknown_count + 1))
+      done <<<"$listeners"
+
+      if (( unknown_count > 0 )); then
+        echo "  $unknown_count unknown listener(s) — consider: slipway claim <name> --port <N>"
+        issues=$((issues + 1))
+      else
+        echo "  all listeners accounted for"
       fi
-    done <<<"$claim_ports"
-    if (( stale_count == 0 )); then
-      echo "  all claims have active listeners"
+    fi
+
+    # 4. Stale claims
+    echo "--- stale claims ---"
+    local stale_count=0
+    local claim_ports
+    claim_ports=$(jq -r '.claims // {} | to_entries[] | "\(.key) \(.value.port)"' "$REGISTRY")
+    if [[ -z "$claim_ports" ]]; then
+      echo "  (no claims)"
+    else
+      while read -r name port; do
+        local pid_info
+        pid_info=$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)
+        if [[ -z "$pid_info" ]]; then
+          echo "  idle: :$port — $name (nothing listening)"
+          stale_count=$((stale_count + 1))
+        fi
+      done <<<"$claim_ports"
+      if (( stale_count == 0 )); then
+        echo "  all claims have active listeners"
+      fi
     fi
   fi
 
