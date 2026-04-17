@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# slipway — machine-wide port-range registry for local dev.
+# slipway — machine-wide port registry for local dev.
 # https://github.com/primestageprime/slipway
 # shellcheck disable=SC2016  # jq programs use $var for jq-level vars, not shell expansion
 set -euo pipefail
@@ -9,9 +9,9 @@ if (( BASH_VERSINFO[0] < 3 || (BASH_VERSINFO[0] == 3 && BASH_VERSINFO[1] < 2) ))
   exit 1
 fi
 
-readonly SLIPWAY_VERSION="0.2.0"
+readonly SLIPWAY_VERSION="1.0.0"
 REGISTRY="${SLIPWAY_REGISTRY:-$HOME/.config/slipway/registry.json}"
-REGISTRY_VERSION=1
+REGISTRY_VERSION=2
 LOCK_TIMEOUT_DS="${SLIPWAY_LOCK_TIMEOUT_DS:-100}"  # tenths of a second
 
 # Exit codes (documented in README). Scripts can branch on these.
@@ -49,12 +49,12 @@ ensure_registry() {
     cat > "$REGISTRY" <<JSON
 {
   "registry_version": $REGISTRY_VERSION,
-  "port_range": { "start": 4000, "end": 9999 },
+  "auto_pool": { "start": 4000, "end": 9999 },
   "reserved": [
-    { "start": 5000, "end": 5000, "note": "macOS AirPlay Receiver (ControlCenter)" },
-    { "start": 7000, "end": 7000, "note": "macOS AirPlay Receiver (ControlCenter)" }
+    { "port": 5000, "note": "macOS AirPlay Receiver (ControlCenter)" },
+    { "port": 7000, "note": "macOS AirPlay Receiver (ControlCenter)" }
   ],
-  "apps": {}
+  "claims": {}
 }
 JSON
   fi
@@ -63,13 +63,14 @@ JSON
 }
 
 validate_registry() {
-  # Let jq's stderr through so real failures (missing jq binary, unreadable
-  # file, malformed JSON) surface before we die.
   if ! jq -e '
-    (.port_range.start | type == "number") and
-    (.port_range.end   | type == "number") and
-    (.port_range.end >= .port_range.start) and
-    ((.apps // {})     | type == "object") and
+    has("auto_pool") and
+    (.auto_pool | has("start") and has("end")) and
+    (.auto_pool.start | type == "number") and
+    (.auto_pool.end   | type == "number") and
+    (.auto_pool.end >= .auto_pool.start) and
+    has("claims") and
+    (.claims | type == "object") and
     ((.reserved // []) | type == "array")
   ' "$REGISTRY" >/dev/null; then
     die_code "$E_SCHEMA" "registry schema invalid: $REGISTRY"
@@ -77,9 +78,13 @@ validate_registry() {
 }
 
 migrate_registry() {
-  # Add missing registry_version to pre-versioned files. Must take the lock
-  # before writing, and re-read under the lock in case a parallel invocation
-  # migrated first.
+  # Pre-migration sanity check: the file must be a JSON object with at least
+  # one recognizable field (auto_pool, port_range, claims, or apps).
+  if ! jq -e '
+    type == "object" and (has("auto_pool") or has("port_range") or has("claims") or has("apps") or has("registry_version"))
+  ' "$REGISTRY" >/dev/null 2>&1; then
+    die_code "$E_SCHEMA" "registry schema invalid: $REGISTRY"
+  fi
   local v
   v=$(jq -r '.registry_version // 0' "$REGISTRY")
   if (( v > REGISTRY_VERSION )); then
@@ -87,9 +92,33 @@ migrate_registry() {
   fi
   if (( v < REGISTRY_VERSION )); then
     acquire_lock
+    # Re-read under lock
     v=$(jq -r '.registry_version // 0' "$REGISTRY")
     if (( v < REGISTRY_VERSION )); then
-      write_unlocked --argjson vv "$REGISTRY_VERSION" '.registry_version = $vv'
+      # Migrate from v0/v1 (range-based) to v2 (per-port claims)
+      write_unlocked --argjson vv "$REGISTRY_VERSION" '
+        # Convert port_range → auto_pool
+        (if .port_range then {auto_pool: .port_range} else {auto_pool: (.auto_pool // {start:4000, end:9999})} end) as $pool
+        # Convert apps (range-based) → claims (per-port, port = start)
+        | (if .apps then
+            (.apps | to_entries | map({key: .key, value: {port: .value.start}}) | from_entries)
+          else
+            (.claims // {})
+          end) as $claims
+        # Convert reserved entries: {start,end} → {port} (use start as port)
+        | ((.reserved // []) | map(
+            if .port then .
+            elif .start then {port: .start} + (if .note then {note} else {} end)
+            else .
+            end
+          )) as $res
+        | {
+            registry_version: $vv,
+            auto_pool: $pool.auto_pool,
+            reserved: $res,
+            claims: $claims
+          }
+      '
     fi
   fi
 }
@@ -147,38 +176,34 @@ write_unlocked() {
   fi
 }
 
-# Emit a single allocation in either plain "START END" or JSON form.
-emit_allocation() {
-  local app="$1" s="$2" e="$3" json="$4"
+# Emit a single claim in either plain port or JSON form.
+emit_claim() {
+  local name="$1" port="$2" json="$3"
   if (( json == 1 )); then
-    jq -nc --arg a "$app" --argjson s "$s" --argjson e "$e" \
-      '{app:$a, start:$s, end:$e, size:($e - $s + 1)}'
+    jq -nc --arg n "$name" --argjson p "$port" '{name:$n, port:$p}'
   else
-    echo "$s $e"
+    echo "$port"
   fi
 }
 
 usage() {
   cat <<'EOF'
-slipway — hand out port ranges to local dev apps so they don't collide.
+slipway — hand out ports to local dev apps so they don't collide.
 
 Usage:
-  slipway claim <app> <size> [--dry-run] [--json]
-  slipway reclaim <app> <size> [--no-move] [--json]  Atomically release + re-claim at <size>
-  slipway ensure <app> <size> [--json]               Claim if missing; noop if claimed at same size
-  slipway get <app> [--json]                         Print "START END" (exit 3 if unclaimed)
-  slipway port <app> [offset]                        Print a single port (start+offset)
-  slipway release <app> [--if-claimed]               Free an app's range; --if-claimed = idempotent
-  slipway list [--json|--tsv]                        Show all allocations
-  slipway conflicts <port> [--json]                  Show who holds <port>; exit 3 if free
-  slipway doctor [--repair]                          Sanity-check the registry; --repair clears orphan lock
-  slipway caddy <app> [subdomain] [offset]           Emit a Caddyfile fragment for <app>
-  slipway config [show]                              Show port_range + registry_version
-  slipway config port-range <s> <e>                  Reconfigure port_range (refuses orphaning apps)
-  slipway version                                    Print slipway version
+  slipway claim <name> [--port N] [--desc text] [--dry-run] [--json]
+  slipway get <name> [--json]                    Print the claimed port (exit 3 if unclaimed)
+  slipway release <name> [--if-claimed]          Free a claim; --if-claimed = idempotent
+  slipway list [--json|--tsv]                    Show all claims
+  slipway conflicts <port> [--json]              Show who holds <port>; exit 3 if free
+  slipway check                                  (not yet implemented)
+  slipway doctor                                 (not yet implemented)
+  slipway config [show]                          Show auto_pool + registry_version
+  slipway config auto-pool <s> <e>               Reconfigure auto_pool
+  slipway version                                Print slipway version
   slipway reserved [list|--json]
-  slipway reserved add <s> <e> [note] [--force]      Add a reserved range (refuses app overlap without --force)
-  slipway reserved remove <s>                        Remove a reserved entry by start port
+  slipway reserved add <port> [note]             Add a reserved port
+  slipway reserved remove <port>                 Remove a reserved port
 
 Exit codes:
   0 ok  1 generic  2 usage  3 not-found  4 exhausted  5 lock-timeout  6 conflict  7 schema
@@ -207,15 +232,12 @@ sub="$1"; shift || true
 ensure_registry
 case "$sub" in
   claim)     cmd_claim "$@" ;;
-  reclaim)   cmd_reclaim "$@" ;;
-  ensure)    cmd_ensure "$@" ;;
   get)       cmd_get "$@" ;;
-  port)      cmd_port "$@" ;;
   release)   cmd_release "$@" ;;
   list)      cmd_list "$@" ;;
   conflicts) cmd_conflicts "$@" ;;
+  check)     cmd_check "$@" ;;
   doctor)    cmd_doctor "$@" ;;
-  caddy)     cmd_caddy "$@" ;;
   config)    cmd_config "$@" ;;
   reserved)  cmd_reserved "$@" ;;
   *) usage ;;
