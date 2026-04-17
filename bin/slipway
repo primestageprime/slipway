@@ -196,8 +196,8 @@ Usage:
   slipway release <name> [--if-claimed]          Free a claim; --if-claimed = idempotent
   slipway list [--json|--tsv]                    Show all claims
   slipway conflicts <port> [--json]              Show who holds <port>; exit 3 if free
-  slipway check                                  (not yet implemented)
-  slipway doctor                                 (not yet implemented)
+  slipway check <name>                            Check if claimed port is in use
+  slipway doctor [--repair]                      Health check: locks, dupes, listeners
   slipway config [show]                          Show auto_pool + registry_version
   slipway config auto-pool <s> <e>               Reconfigure auto_pool
   slipway version                                Print slipway version

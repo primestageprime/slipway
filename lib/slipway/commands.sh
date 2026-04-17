@@ -303,9 +303,141 @@ cmd_config() {
 }
 
 cmd_check() {
-  die "check not yet implemented"
+  local name="${1:-}"
+  [[ -n "$name" ]] || die_code "$E_USAGE" "usage: slipway check <name>"
+  local port
+  port=$(jq -r --arg n "$name" '.claims[$n].port // empty' "$REGISTRY")
+  [[ -n "$port" ]] || die_code "$E_NOTFOUND" "no claim for '$name'"
+
+  local pid_info
+  pid_info=$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)
+  if [[ -z "$pid_info" ]]; then
+    echo "ok: port $port ($name) is free"
+    return 0
+  fi
+
+  local pid
+  pid=$(echo "$pid_info" | head -1)
+  local proc_name
+  proc_name=$(ps -p "$pid" -o comm= 2>/dev/null || echo "unknown")
+  echo "CONFLICT: port $port ($name) in use by $proc_name (PID $pid)"
+  return 1
 }
 
 cmd_doctor() {
-  die "doctor not yet implemented"
+  local repair=0
+  case "${1:-}" in
+    --repair) repair=1 ;;
+    "") ;;
+    *) die_code "$E_USAGE" "unknown flag: $1" ;;
+  esac
+
+  local issues=0
+
+  # 1. Lock check
+  local lock="${REGISTRY}.lock"
+  if [[ -d "$lock" ]]; then
+    local pid
+    pid=$(cat "$lock/pid" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "ok: lock held by live pid $pid"
+    elif (( repair == 1 )); then
+      local pid2
+      pid2=$(cat "$lock/pid" 2>/dev/null || true)
+      if [[ "$pid" != "$pid2" ]] || { [[ -n "$pid2" ]] && kill -0 "$pid2" 2>/dev/null; }; then
+        echo "ok: lock reclaimed by live process (pid=$pid2)"
+      else
+        rm -rf "$lock" 2>/dev/null || die "cannot remove $lock"
+        echo "repaired: removed orphaned lock at $lock (pid=${pid:-<empty>})"
+      fi
+    else
+      echo "WARN: orphaned lock at $lock (pid=${pid:-<empty>}); re-run with --repair or rm -rf"
+      issues=$((issues + 1))
+    fi
+  else
+    echo "ok: no outstanding lock"
+  fi
+
+  # 2. Duplicate port check
+  local dupes
+  dupes=$(jq -r '
+    [(.claims // {} | to_entries[] | {name: .key, port: .value.port})]
+    | group_by(.port)
+    | map(select(length > 1))
+    | map("  port " + (.[0].port|tostring) + ": " + ([.[].name] | join(", ")))
+    | .[]
+  ' "$REGISTRY")
+  if [[ -n "$dupes" ]]; then
+    echo "WARN: duplicate ports in claims:"
+    printf '%s\n' "$dupes"
+    issues=$((issues + 1))
+  else
+    echo "ok: no duplicate ports in claims"
+  fi
+
+  # 3. Scan listening ports
+  echo "--- listening ports ---"
+  local listeners
+  listeners=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null \
+    | awk 'NR>1 { split($9, a, ":"); port=a[length(a)]; if (port+0 > 1024) print port, $1, $2 }' \
+    | sort -t' ' -k1 -n -u || true)
+
+  if [[ -z "$listeners" ]]; then
+    echo "  (no TCP listeners above 1024)"
+  else
+    local claimed_json reserved_json
+    claimed_json=$(jq -c '[.claims // {} | to_entries[] | {(.value.port|tostring): .key}] | add // {}' "$REGISTRY")
+    reserved_json=$(jq -c '[(.reserved // [])[] | {(.port|tostring): (.note // "reserved")}] | add // {}' "$REGISTRY")
+
+    local unknown_count=0
+    while read -r port proc pid; do
+      local owner
+      owner=$(jq -r --arg p "$port" '.[$p] // empty' <<<"$claimed_json")
+      if [[ -n "$owner" ]]; then
+        echo "  ok: :$port — $owner ($proc, pid $pid)"
+        continue
+      fi
+      owner=$(jq -r --arg p "$port" '.[$p] // empty' <<<"$reserved_json")
+      if [[ -n "$owner" ]]; then
+        echo "  ok: :$port — reserved ($owner) ($proc, pid $pid)"
+        continue
+      fi
+      echo "  UNKNOWN: :$port — $proc (pid $pid) — not claimed or reserved"
+      unknown_count=$((unknown_count + 1))
+    done <<<"$listeners"
+
+    if (( unknown_count > 0 )); then
+      echo "  $unknown_count unknown listener(s) — consider: slipway claim <name> --port <N>"
+      issues=$((issues + 1))
+    else
+      echo "  all listeners accounted for"
+    fi
+  fi
+
+  # 4. Stale claims
+  echo "--- stale claims ---"
+  local stale_count=0
+  local claim_ports
+  claim_ports=$(jq -r '.claims // {} | to_entries[] | "\(.key) \(.value.port)"' "$REGISTRY")
+  if [[ -z "$claim_ports" ]]; then
+    echo "  (no claims)"
+  else
+    while read -r name port; do
+      local pid_info
+      pid_info=$(lsof -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)
+      if [[ -z "$pid_info" ]]; then
+        echo "  idle: :$port — $name (nothing listening)"
+        stale_count=$((stale_count + 1))
+      fi
+    done <<<"$claim_ports"
+    if (( stale_count == 0 )); then
+      echo "  all claims have active listeners"
+    fi
+  fi
+
+  if (( issues == 0 )); then
+    echo "registry healthy"
+    return 0
+  fi
+  return "$E_GENERIC"
 }

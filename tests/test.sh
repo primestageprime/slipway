@@ -389,10 +389,110 @@ else
   fail=$((fail + 1))
 fi
 
-echo "# check and doctor are stubs"
+echo "# check: port free"
 fresh_registry
-assert_exit 1 "check not yet implemented" "$SLIPWAY" check
-assert_exit 1 "doctor not yet implemented" "$SLIPWAY" doctor
+"$SLIPWAY" claim highport --port 19876 >/dev/null
+out=$("$SLIPWAY" check highport)
+assert_eq "$out" "ok: port 19876 (highport) is free" "check free port"
+
+echo "# check: unclaimed name → E_NOTFOUND"
+fresh_registry
+assert_exit 3 "check unclaimed name exits E_NOTFOUND" "$SLIPWAY" check nonexistent
+
+echo "# check: missing name → E_USAGE"
+fresh_registry
+assert_exit 2 "check with no args exits E_USAGE" "$SLIPWAY" check
+
+echo "# doctor: runs and includes expected sections"
+fresh_registry
+out=$("$SLIPWAY" doctor 2>&1 || true)
+if [[ "$out" == *"no outstanding lock"* ]]; then
+  echo "  ok: doctor reports lock status"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: doctor lock status: $out"
+  fail=$((fail + 1))
+fi
+if [[ "$out" == *"no duplicate ports in claims"* ]]; then
+  echo "  ok: doctor reports no duplicate ports"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: doctor duplicate ports: $out"
+  fail=$((fail + 1))
+fi
+if [[ "$out" == *"--- listening ports ---"* ]]; then
+  echo "  ok: doctor output includes listening ports section"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: doctor listening ports section missing: $out"
+  fail=$((fail + 1))
+fi
+if [[ "$out" == *"--- stale claims ---"* ]]; then
+  echo "  ok: doctor output includes stale claims section"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: doctor stale claims section missing: $out"
+  fail=$((fail + 1))
+fi
+
+echo "# doctor: orphaned lock detection"
+fresh_registry
+mkdir "$SLIPWAY_REGISTRY.lock"
+echo "9999999" > "$SLIPWAY_REGISTRY.lock/pid"
+out=$("$SLIPWAY" doctor 2>&1 || true)
+if [[ "$out" == *"WARN: orphaned lock"* ]]; then
+  echo "  ok: doctor detects orphaned lock"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: doctor orphaned lock: $out"
+  fail=$((fail + 1))
+fi
+rm -rf "$SLIPWAY_REGISTRY.lock"
+
+echo "# doctor --repair removes orphaned lock"
+fresh_registry
+mkdir "$SLIPWAY_REGISTRY.lock"
+echo "9999999" > "$SLIPWAY_REGISTRY.lock/pid"
+out=$("$SLIPWAY" doctor --repair 2>&1 || true)
+if [[ "$out" == *"repaired: removed orphaned lock"* ]]; then
+  echo "  ok: --repair removes orphaned lock"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: --repair orphaned lock: $out"
+  fail=$((fail + 1))
+fi
+if [[ ! -d "$SLIPWAY_REGISTRY.lock" ]]; then
+  echo "  ok: lock directory removed after repair"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: lock directory still exists after repair"
+  fail=$((fail + 1))
+fi
+
+echo "# doctor --repair is noop on healthy registry"
+fresh_registry
+out=$("$SLIPWAY" doctor --repair 2>&1 || true)
+if [[ "$out" == *"no outstanding lock"* && "$out" == *"no duplicate ports"* ]]; then
+  echo "  ok: --repair noop on healthy registry"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: --repair noop: $out"
+  fail=$((fail + 1))
+fi
+
+echo "# doctor --repair refuses to clear live lock"
+fresh_registry
+mkdir "$SLIPWAY_REGISTRY.lock"
+echo "$$" > "$SLIPWAY_REGISTRY.lock/pid"
+out=$("$SLIPWAY" doctor --repair 2>&1 || true)
+if [[ "$out" == *"ok: lock held by live pid"* || "$out" == *"ok: lock reclaimed by live process"* ]]; then
+  echo "  ok: --repair does not remove live lock"
+  pass=$((pass + 1))
+else
+  echo "  FAIL: --repair live lock: $out"
+  fail=$((fail + 1))
+fi
+rm -rf "$SLIPWAY_REGISTRY.lock"
 
 echo "# list --tsv"
 fresh_registry
